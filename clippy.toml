@@ -1,0 +1,7 @@
+# Tests may unwrap, expect and panic (a failed test is the point); the game's code may not.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+# The original's routines take many values (a fight's step, a stage's draw): as many arguments as they need.
+too-many-arguments-threshold = 12
+type-complexity-threshold = 500

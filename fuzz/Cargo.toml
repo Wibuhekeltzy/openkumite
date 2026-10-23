@@ -1,0 +1,109 @@
+[package]
+name = "openkumite-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kumite_assets = { path = "../crates/kumite_assets" }
+kumite_game = { path = "../crates/kumite_game" }
+kumite_net = { path = "../crates/kumite_net" }
+# (what ggrs 0.13 decodes a peer's inputs with: the checks of kumite_net must keep it from panicking)
+bitfield-rle = "=0.2.1"
+serde_json = "1"
+ggrs = "=0.13.0"
+
+# (its own workspace: built with nightly and the sanitizer, outside the game's)
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "lobby_msg"
+path = "fuzz_targets/lobby_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lobby_packet"
+path = "fuzz_targets/lobby_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ggrs_message"
+path = "fuzz_targets/ggrs_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_header"
+path = "fuzz_targets/relay_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avi"
+path = "fuzz_targets/avi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glb_character"
+path = "fuzz_targets/glb_character.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glb_stage"
+path = "fuzz_targets/glb_stage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pad_script"
+path = "fuzz_targets/pad_script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ggrs_inputs"
+path = "fuzz_targets/ggrs_inputs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reliable"
+path = "fuzz_targets/reliable.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "glb_parts"
+path = "fuzz_targets/glb_parts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ggrs_session"
+path = "fuzz_targets/ggrs_session.rs"
+test = false
+doc = false
+bench = false

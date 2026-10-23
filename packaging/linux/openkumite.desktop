@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenKumite
+GenericName=Fighting Game
+Comment=Open-source 3D fighting game engine
+Exec=openkumite
+Icon=openkumite
+Terminal=false
+Categories=Game;ActionGame;
+Keywords=fighting;versus;arcade;
+StartupWMClass=openkumite

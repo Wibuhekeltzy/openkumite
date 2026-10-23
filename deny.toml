@@ -1,0 +1,27 @@
+# cargo deny check (run by check.sh push and the git pre-push hook): advisories, licenses, bans, sources.
+[graph]
+all-features = false
+
+[advisories]
+ignore = [
+    # unmaintained, no replacement in the crates that bring them (nothing known wrong with them):
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1: ggrs's message encoding (the rollback packets use it too)" },
+    { id = "RUSTSEC-2024-0384", reason = "instant: ggrs's timer" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: egui's font loading (our own embedded fonts only)" },
+]
+
+[licenses]
+# Permissive licenses only (OpenKumite is MIT OR Apache-2.0); CDLA-Permissive-2.0: webpki-roots, the Mozilla CA list (wss).
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "BSL-1.0", "MPL-2.0", "OFL-1.1", "Ubuntu-font-1.0", "0BSD", "Unlicense", "CDLA-Permissive-2.0"]
+confidence-threshold = 0.9
+
+[bans]
+# Several versions of one crate come with the graphics and networking stacks (windows-sys, bitflags, ...): noted.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

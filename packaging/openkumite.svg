@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- OpenKumite's icon: a K in mid-strike (a punch up, a kick down) over a rising sun, with the hit's spark -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26262f"/>
+      <stop offset="1" stop-color="#0d0d12"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.42" cy="0.36" r="0.75">
+      <stop offset="0" stop-color="#ff6a3d"/>
+      <stop offset="0.65" stop-color="#e2321f"/>
+      <stop offset="1" stop-color="#a9160f"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#tile)"/>
+  <circle cx="256" cy="256" r="160" fill="url(#sun)"/>
+  <g fill="#f5f0e6">
+    <!-- stem, leaning into the strike -->
+    <path d="M166 112 H232 L214 400 H148 Z"/>
+    <!-- the arms: a punch up and out, a kick down and out -->
+    <path d="M200 236 L332 120 L400 120 L266 258 L406 400 L336 400 L200 292 Z"/>
+  </g>
+  <!-- the hit's spark, at the punch -->
+  <path d="M410 66 L420 94 L448 104 L420 114 L410 142 L400 114 L372 104 L400 94 Z" fill="#ffd166"/>
+</svg>

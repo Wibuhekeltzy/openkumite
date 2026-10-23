@@ -1,0 +1,14 @@
+# nfpm (the Linux packages: packaging/linux/nfpm.yaml), a pinned release for the runner's architecture
+name: nfpm
+description: Install nfpm
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        NFPM: 2.47.0
+      run: |
+        case "$(uname -m)" in x86_64) a=x86_64 ;; aarch64) a=arm64 ;; *) echo "::error::no nfpm for $(uname -m)"; exit 1 ;; esac
+        curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v$NFPM/nfpm_${NFPM}_Linux_$a.tar.gz" | tar -xz -C "$RUNNER_TEMP" nfpm
+        echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/nfpm" --version | head -1

@@ -1,0 +1,8 @@
+pkg/
+assets
+# web/compress.sh: the compressed copies
+*.gz
+*.br
+# kumite_converter's page, copied in to serve with the game (docs/usage/browser.md)
+convert.html
+convert_worker.js

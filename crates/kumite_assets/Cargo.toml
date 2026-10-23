@@ -1,0 +1,19 @@
+[package]
+name = "kumite_assets"
+description = "Loads the converted assets (glTF characters and stages, JSON game data)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+kumite_fs.workspace = true
+anyhow.workspace = true
+log.workspace = true
+glam.workspace = true
+gltf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

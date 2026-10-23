@@ -1,0 +1,326 @@
+# A release for a version tag: vX.Y.Z (a release) or vX.Y.Z-suffix (a pre-release), equal to Cargo.toml's
+# workspace version. Each platform's openkumite (and serve, the browser build's web server) is built on its own kind
+# of runner (profile dist), packed with the licenses and notices, and published with SHA256SUMS:
+#   linux-amd64, linux-arm64      glibc 2.28 or newer (any distribution since 2018): only libc, ALSA and libudev,
+#                                 which every desktop has; the GPU and the display (Vulkan / GL, X11 / Wayland) are
+#                                 loaded when it starts. (Not static musl: a static program can load no library, so
+#                                 it could not draw.) serve is static (musl). Also as packages (packaging/linux,
+#                                 nfpm): .deb, .rpm, Arch's .pkg.tar.zst, and Alpine's .apk from its own build
+#                                 (musl, linked dynamically: packaging/linux/alpine.sh)
+#   windows-amd64, windows-arm64  .exe with the C runtime linked in (.cargo/config.toml): only Windows' own DLLs
+#   macos-universal               OpenKumite.app (packaging/macos), arm64 + x86_64, macOS 11+
+#   web                           the browser build (web/build.sh): to serve from a site
+# Run by hand (Actions, release, Run workflow) on any branch, it builds all of it without publishing: the files are
+# the run's artifacts, named vX.Y.Z-dev.<commit>.
+name: release
+
+# A release comes from either: a tag pushed with git (the release is made here), or a release published on GitHub's
+# Releases page (the files are added to it). Publishing one there with a new tag also pushes the tag: of the two runs,
+# the later one goes on (concurrency), and both would make the same files.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # the build's name (TAG): a tag's, equal to Cargo.toml's version; by hand, that version with -dev.<commit>
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: tag
+        env:
+          REF: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "$REF_TYPE" = tag ]; then
+            [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::$REF is not vX.Y.Z[-suffix]"; exit 1; }
+            [ "v$v" = "$REF" ] || { echo "::error::tag $REF, but Cargo.toml's version is $v"; exit 1; }
+            tag=$REF
+          else
+            tag=v$v-dev.${GITHUB_SHA::7}
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "building $tag"
+
+  linux:
+    needs: version
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64, goarch: amd64, name: linux-amd64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, goarch: arm64, name: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-gnu, ${{ matrix.arch }}-unknown-linux-musl
+      # ALSA (rodio's sound) and libudev (gilrs' gamepads): linked to the system's
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      # zig links against glibc 2.28's symbols (the runner's own glibc is newer), and serve statically (musl)
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      # (the runner's libasound.so is built for its own, newer glibc: its symbols are the system's at run time)
+      - env:
+          RUSTFLAGS: -C link-arg=-Wl,--allow-shlib-undefined
+        run: |
+          cargo zigbuild --profile dist -p openkumite --target ${{ matrix.arch }}-unknown-linux-gnu.2.28
+          cargo zigbuild --profile dist -p serve --target ${{ matrix.arch }}-unknown-linux-musl
+      - name: glibc 2.28, static serve, and they run
+        run: |
+          bin=target/${{ matrix.arch }}-unknown-linux-gnu/dist/openkumite
+          newest=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "needs $newest; $(readelf -d "$bin" | grep NEEDED | grep -o '\[.*\]' | tr '\n' ' ')"
+          [ "$(printf '%s\nGLIBC_2.28\n' "$newest" | sort -V | tail -1)" = GLIBC_2.28 ] || { echo "::error::needs $newest"; exit 1; }
+          "$bin" --help | head -1
+          serve=target/${{ matrix.arch }}-unknown-linux-musl/dist/serve
+          file "$serve" | grep -q 'statically linked' || { file "$serve"; echo "::error::serve is not static"; exit 1; }
+      - name: Pack
+        run: |
+          d=openkumite-$TAG-${{ matrix.name }}
+          mkdir "$d" && cp target/${{ matrix.arch }}-unknown-linux-gnu/dist/openkumite target/${{ matrix.arch }}-unknown-linux-musl/dist/serve \
+            README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md "$d/"
+          tar -czf "$d.tar.gz" "$d"
+      - uses: ./.github/actions/nfpm
+      - name: deb, rpm, Arch
+        env:
+          VERSION: ${{ needs.version.outputs.tag }}
+          ARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p target/package && cp target/${{ matrix.arch }}-unknown-linux-gnu/dist/openkumite target/package/openkumite
+          export VERSION=${VERSION#v}
+          for p in deb rpm archlinux; do nfpm package -f packaging/linux/nfpm.yaml -p $p -t .; done
+          ls -l ./*.deb ./*.rpm ./*.pkg.tar.zst
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            openkumite-*.tar.gz
+            openkumite*.deb
+            openkumite*.rpm
+            openkumite*.pkg.tar.zst
+
+  # Alpine: its own build (musl), in an Alpine container (packaging/linux/alpine.sh; docker run, as GitHub runs no
+  # actions inside an arm64 Alpine container)
+  alpine:
+    needs: version
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64, goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, goarch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker run --rm -v "$PWD:/src" -w /src alpine:3.20 sh packaging/linux/alpine.sh
+      - uses: ./.github/actions/nfpm
+      - name: apk
+        env:
+          VERSION: ${{ needs.version.outputs.tag }}
+          ARCH: ${{ matrix.goarch }}
+        run: |
+          # (the container's files are root's)
+          sudo chown -R "$(id -u)" target
+          mkdir -p target/package && cp target/${{ matrix.arch }}-unknown-linux-musl/dist/openkumite target/package/openkumite
+          export VERSION=${VERSION#v}
+          nfpm package -f packaging/linux/nfpm.yaml -p apk -t .
+          ls -l ./*.apk
+      - uses: actions/upload-artifact@v7
+        with:
+          name: alpine-${{ matrix.goarch }}
+          path: openkumite*.apk
+
+  windows:
+    needs: version
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    strategy:
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, name: windows-amd64 }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, name: windows-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # ring (rustls, for online play's wss signalling) builds its ARM64 Windows assembly with clang only
+      - name: clang (arm64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            if (-not (Test-Path "C:\Program Files\LLVM\bin\clang.exe")) { choco install llvm -y --no-progress }
+            "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          }
+      # the C runtime linked in (.cargo/config.toml)
+      - run: cargo build --profile dist -p openkumite -p serve --target ${{ matrix.target }}
+      - name: No VC++ runtime needed, and it runs
+        shell: pwsh
+        run: |
+          foreach ($b in "openkumite", "serve") {
+            $bin = "target\${{ matrix.target }}\dist\$b.exe"
+            if (Select-String -Path $bin -Pattern "VCRUNTIME140" -SimpleMatch -Quiet) { Write-Error "$b imports the VC++ runtime"; exit 1 }
+          }
+          & "target\${{ matrix.target }}\dist\openkumite.exe" --help | Select-Object -First 1
+      - name: Pack
+        shell: pwsh
+        run: |
+          $d = "openkumite-$env:TAG-${{ matrix.name }}"
+          New-Item -ItemType Directory $d | Out-Null
+          Copy-Item "target\${{ matrix.target }}\dist\openkumite.exe", "target\${{ matrix.target }}\dist\serve.exe", README.md, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md $d
+          Compress-Archive $d "$d.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: openkumite-*.zip
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - run: |
+          cargo build --profile dist -p openkumite -p serve --target aarch64-apple-darwin
+          cargo build --profile dist -p openkumite -p serve --target x86_64-apple-darwin
+      - name: Universal, and it runs
+        run: |
+          for b in openkumite serve; do
+            lipo -create -output $b target/aarch64-apple-darwin/dist/$b target/x86_64-apple-darwin/dist/$b
+            lipo -info $b
+          done
+          ./openkumite --help | head -1
+      # OpenKumite.app (its icon, Info.plist, signed ad hoc), serve beside it
+      - name: Pack
+        run: |
+          d=openkumite-$TAG-macos-universal
+          mkdir "$d" && sh packaging/macos/bundle.sh openkumite "${TAG#v}" "$d"
+          cp serve README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md "$d/"
+          tar -czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-universal
+          path: openkumite-*.tar.gz
+
+  wasm:
+    needs: version
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129
+      - name: The browser build
+        run: |
+          mkdir -p target/tools/bin && ln -s "$(command -v wasm-bindgen)" target/tools/bin/wasm-bindgen
+          sh web/build.sh
+          d=openkumite-$TAG-web
+          mkdir -p "$d/pkg" && cp web/index.html web/preload.json README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md "$d/"
+          cp web/pkg/* "$d/pkg/"
+          zip -qr "$d.zip" "$d"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web
+          path: openkumite-*.zip
+
+  release:
+    # (a tag only: a run by hand keeps its files as the run's artifacts)
+    if: github.ref_type == 'tag'
+    needs: [version, linux, alpine, windows, macos, wasm]
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      # Into the tag's release: one made on the Releases page (or by an earlier run of this) keeps its title and text,
+      # its downloads section put in again (between the markers); else a new one, GitHub's list of changes first
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cat > downloads.md <<EOF
+          <!-- openkumite-downloads -->
+          ## Downloads
+
+          OpenKumite plays the game data converted by [kumite_converter](https://github.com/openkimute/kumite_converter):
+          put its output in \`assets/\` next to the program, or run \`openkumite --assets DIR\` (the README has the rest).
+
+          | Download | For |
+          |---|---|
+          | \`openkumite-$TAG-linux-amd64.tar.gz\`, \`-linux-arm64\` | Linux with glibc 2.28 or newer (any distribution since 2018) |
+          | \`.deb\` | Debian, Ubuntu, Mint: \`sudo apt install ./openkumite_*.deb\` |
+          | \`.rpm\` | Fedora, openSUSE, RHEL: \`sudo dnf install ./openkumite-*.rpm\` |
+          | \`.pkg.tar.zst\` | Arch, Manjaro: \`sudo pacman -U openkumite-*.pkg.tar.zst\` |
+          | \`.apk\` | Alpine (its own musl build): \`sudo apk add --allow-untrusted openkumite_*.apk\` |
+          | \`openkumite-$TAG-windows-amd64.zip\`, \`-windows-arm64\` | Windows 10 and 11 |
+          | \`openkumite-$TAG-macos-universal.tar.gz\` | macOS 11 and newer, Apple Silicon and Intel: OpenKumite.app |
+          | \`openkumite-$TAG-web.zip\` | the game in the browser, to serve from a site (with the converted \`assets/\` beside it) |
+          | \`SHA256SUMS\` | the checksums of the files above |
+
+          Each native download also has \`serve\`, a local web server for the browser build.
+
+          The binaries are not signed. **macOS** blocks a downloaded program the first time: run
+          \`xattr -dr com.apple.quarantine OpenKumite.app\`, or allow it in System Settings, Privacy & Security.
+          **Windows** may warn when it is started from Explorer: More info, Run anyway (or Unblock in the file's
+          Properties).
+          <!-- /openkumite-downloads -->
+          EOF
+          if gh release view "$TAG" --json body --jq .body > body.md 2>/dev/null; then
+            # (the text without the old section and its trailing blank lines)
+            awk '/<!-- openkumite-downloads -->/ { skip = 1 }
+                 !skip { if ($0 == "") blank++; else { for (; blank > 0; blank--) print ""; print } }
+                 /<!-- \/openkumite-downloads -->/ { skip = 0 }' body.md > notes.md
+            printf '\n' >> notes.md && cat downloads.md >> notes.md
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body > notes.md
+            printf '\n\n' >> notes.md && cat downloads.md >> notes.md
+            pre=""; [[ "$TAG" == *-* ]] && pre="--prerelease"
+            gh release create "$TAG" dist/* --verify-tag --title "OpenKumite $TAG" --notes-file notes.md $pre
+          fi

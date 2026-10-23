@@ -1,0 +1,71 @@
+[package]
+name = "openkumite"
+description = "OpenKumite, a 3D fighting game engine that plays game data converted by kumite_converter"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+kumite_fs.workspace = true
+kumite_net.workspace = true
+anyhow.workspace = true
+log.workspace = true
+glam.workspace = true
+winit.workspace = true
+kumite_render.workspace = true
+png.workspace = true
+kumite_assets.workspace = true
+kumite_sim.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+kumite_game.workspace = true
+egui = "0.36"
+egui-wgpu = "0.36"
+web-time = "1"
+zune-jpeg = "0.5"
+zune-core = "0.5"
+
+# online play: rollback (ggrs) over WebRTC (matchbox; and UDP natively)
+matchbox_socket = "0.14"
+# (the room codes; on the web through the browser's crypto: the "js" feature below)
+getrandom = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ggrs = "=0.13.0"
+futures = "0.3"
+# (matchbox's signalling runs on tokio: its loop is polled inside async-compat's tokio context)
+async-compat = "0.2"
+env_logger.workspace = true
+egui-winit = "0.36"
+rodio = { version = "0.22", default-features = false, features = ["playback", "flac", "mp3", "wav"] }
+gilrs = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ggrs = { version = "=0.13.0", features = ["wasm-bindgen"] }
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlAudioElement", "HtmlMediaElement", "Navigator", "UserActivation", "Window", "Document", "Element", "HtmlCanvasElement", "Location", "Storage", "Screen", "MediaQueryList", "Gamepad", "GamepadButton"] }
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+console_log = "1"
+
+# gamepad rumble on macOS (gilrs has none there): the GameController framework's haptics
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSError", "NSDate"] }
+objc2-game-controller = { version = "0.3", default-features = false, features = ["std", "GCController", "GCDevice", "GCDeviceHaptics", "objc2-core-haptics"] }
+objc2-core-haptics = { version = "0.3", default-features = false, features = ["std", "CHHapticEngine", "CHHapticEvent", "CHHapticParameter", "CHHapticPattern", "CHHapticPatternPlayer"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# (a peer on a bare websocket, in online.rs's tests: already in the tree under matchbox's)
+tungstenite = "0.28"
+cargo-husky = { version = "1.5.0", default-features = false, features = ["user-hooks"] }
+
+[build-dependencies]
+# the Windows .exe's icon (build.rs, openkumite.rc): only for a Windows target
+embed-resource = "3"

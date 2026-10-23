@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- phones and tablets: the page at its own size, no zoom (pinching or double taps) -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>OpenKumite</title>
+<!-- the icon (packaging/openkumite.svg, copied in by web/build.sh) -->
+<link rel="icon" type="image/svg+xml" href="pkg/openkumite.svg">
+<style>
+  html, body { margin: 0; height: 100%; height: 100dvh; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { width: 960px; height: 720px; outline: none; }
+  #error a { color: #fff; }
+  #error { position: fixed; top: 16px; left: 16px; right: 16px; color: #f66; font: 14px monospace; white-space: pre-wrap; z-index: 3; }
+  #hint { position: fixed; bottom: 8px; width: 100%; text-align: center; color: #888; font: 13px sans-serif; }
+  /* full screen (the browser's, or the game's): the picture alone */
+  @media (display-mode: fullscreen) { #hint { display: none; } }
+  :root:fullscreen #hint, body:has(:fullscreen) #hint { display: none; }
+
+  /* ---- touch screens: the on-screen pad (a DualShock to the game: the menus, KEY CONFIGURATION, all) ---- */
+  body.touch { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  body.touch #hint { display: none; }
+  /* the pad keeps clear of the notch and the rounded corners (safe area); its box follows the visible viewport */
+  #pad { display: none; position: fixed; z-index: 2; pointer-events: none;
+         top: env(safe-area-inset-top); right: env(safe-area-inset-right); bottom: env(safe-area-inset-bottom); left: env(safe-area-inset-left); }
+  body.touch #pad { display: block; }
+  #pad .zone { position: absolute; top: 0; bottom: 0; pointer-events: auto; touch-action: none; }
+  #pad .left { left: 0; width: 45%; }
+  #pad .right { right: 0; width: 55%; }
+  #pad .ring { position: absolute; width: 130px; height: 130px; margin: -65px 0 0 -65px; border-radius: 50%;
+               border: 2px solid rgba(255,255,255,.35); background: rgba(255,255,255,.08); }
+  #pad .knob { position: absolute; width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 50%;
+               background: rgba(255,255,255,.35); }
+  #pad .btn { position: absolute; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+              font: bold 22px sans-serif; color: rgba(255,255,255,.85); background: rgba(0,0,0,.35);
+              border: 2px solid currentColor; box-sizing: border-box; }
+  #pad .btn.on { background: rgba(255,255,255,.45); }
+  #pad .small { border-radius: 14px; font-size: 13px; }
+  #pad .sys { position: absolute; top: 8px; pointer-events: auto; touch-action: none;
+              padding: 6px 14px; border-radius: 14px; font: bold 12px sans-serif; color: #ddd;
+              background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.4); }
+  #pad .sys.on { background: rgba(255,255,255,.45); }
+  #rotate { display: none; position: fixed; inset: 0; z-index: 4; color: #ddd; font: 18px sans-serif;
+            align-items: center; justify-content: center; text-align: center; background: rgba(0,0,0,.85); }
+  @media (orientation: portrait) { body.touch #rotate { display: flex; } }
+  #tip { display: none; position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 3; max-width: 80%;
+         padding: 8px 14px; border-radius: 10px; font: 13px sans-serif; color: #eee; background: rgba(0,0,0,.75);
+         border: 1px solid rgba(255,255,255,.4); text-align: center; }
+  #loading { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 40%; color: #aaa;
+             font: 13px sans-serif; text-align: center; }
+  #loading .bar { margin-top: 8px; height: 4px; background: #333; }
+  #loading .fill { height: 100%; width: 0; background: #ccc; }
+  #log { display: none; position: fixed; left: 0; top: 0; width: 55%; max-height: 60%; overflow: auto; z-index: 5;
+         font: 10px monospace; color: #cfc; background: rgba(0,0,0,.75); white-space: pre-wrap; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="error"></div>
+<div id="hint">Click the picture for keyboard and sound · arrows / WASD, U I J K (1 2 3 4), Enter = START, Esc = back · gamepads · OPTION &gt; KEY CONFIGURATION / KEYBOARD</div>
+<div id="pad">
+  <div class="zone left"><div class="ring" hidden></div><div class="knob" hidden></div></div>
+  <div class="zone right"></div>
+</div>
+<div id="rotate">Turn the device sideways to play</div>
+<div id="tip">For full screen: Share &rarr; Add to Home Screen, then play from the icon</div>
+<div id="log"></div>
+<div id="loading">LOADING<div class="bar"><div class="fill"></div></div></div>
+<script type="module">
+  // a failure shows on the page, not only in the console
+  const fail = (m) => { document.getElementById('error').textContent += `${m}\n`; };
+  addEventListener('error', (e) => fail(e.message));
+  addEventListener('unhandledrejection', (e) => fail(e.reason));
+  const log = console.error;
+  // (errors the game handles itself, shown on its own screens, stay in the console; a panic shows here)
+  console.error = (...a) => { if (/panicked/i.test(String(a[0]))) fail(String(a[0]).split('\n\nStack')[0]); log(...a); };
+  // #log: the console on the page (for a phone: what did not load or play, and why)
+  if (location.hash.includes('log')) {
+    const box = document.getElementById('log'); box.style.display = 'block';
+    for (const k of ['log', 'info', 'warn', 'error']) {
+      const was = console[k].bind(console);
+      console[k] = (...a) => { was(...a); box.textContent += `${k[0]} ${a.map(String).join(' ')}\n`; box.scrollTop = 1e9; };
+    }
+  }
+  // sound: some browsers (Safari on iPhone) play only elements first played in a touch or click, so the game's music
+  // and sounds use these (audio_web.rs), unlocked with a silent clip on the first one
+  const SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
+  window.__okaudio = { music: new Audio(), sfx: Array.from({ length: 10 }, () => new Audio()) };
+  const unlock = () => {
+    if (window.__okgesture) return;
+    window.__okgesture = true;
+    for (const a of [window.__okaudio.music, ...window.__okaudio.sfx]) {
+      if (!a.src) { a.src = SILENT; a.play().catch(() => {}); }
+    }
+  };
+  for (const e of ['touchend', 'click', 'keydown']) addEventListener(e, unlock, { capture: true });
+  // #webgl: test the WebGL 2 path in a browser that has WebGPU
+  if (location.hash === '#webgl') Object.defineProperty(navigator, 'gpu', { value: undefined });
+
+  // ---- the on-screen pad: window.__oktouch, the standard gamepad layout's 17 buttons held, read by the game as a
+  // gamepad (gamepad_web.rs). Shown on touch screens (or with #touch).
+  const B = { cross: 0, circle: 1, square: 2, triangle: 3, select: 8, start: 9, up: 12, down: 13, left: 14, right: 15 };
+  const held = new Array(17).fill(false);
+  function setupPad() {
+    if (document.body.classList.contains('touch')) return;
+    document.body.classList.add('touch');
+    window.__oktouch = held;
+    const pad = document.getElementById('pad');
+    const left = pad.querySelector('.left'), right = pad.querySelector('.right');
+    const ring = pad.querySelector('.ring'), knob = pad.querySelector('.knob');
+    // the face buttons (the original pad's places), the two pairs the game uses most, START and SELECT
+    const faces = [
+      { label: '△', b: [B.triangle], dx: 0, dy: -1, color: '#5fdc8b' },
+      { label: '□', b: [B.square], dx: -1, dy: 0, color: '#f08cd8' },
+      { label: '○', b: [B.circle], dx: 1, dy: 0, color: '#ff7a6b' },
+      { label: '✕', b: [B.cross], dx: 0, dy: 1, color: '#86a8ff' },
+    ];
+    const pairs = [
+      { label: '1+2', b: [B.square, B.triangle], dx: -1.15, dy: -1.15 },
+      { label: '3+4', b: [B.cross, B.circle], dx: 1.15, dy: 1.15 },
+    ];
+    const els = [];
+    const make = (spec, cls) => {
+      const e = document.createElement('div');
+      e.className = 'btn ' + cls; e.textContent = spec.label;
+      if (spec.color) e.style.color = spec.color;
+      right.appendChild(e); els.push({ e, spec }); return e;
+    };
+    faces.forEach((f) => make(f, ''));
+    pairs.forEach((p) => make(p, 'small'));
+    const sys = [['SELECT', B.select], ['START', B.start]].map(([label, b], k) => {
+      const e = document.createElement('div');
+      // SELECT top left, START top right: in the margins beside the picture, clear of the HUD's timer
+      e.className = 'sys'; e.textContent = label;
+      e.style[k ? 'right' : 'left'] = `max(10px, env(safe-area-inset-${k ? 'right' : 'left'}))`;
+      pad.appendChild(e); return { e, b };
+    });
+    // the face buttons' diamond in the right margin, sized to the screen
+    function layout() {
+      const r = right.getBoundingClientRect();
+      // in the margin beside the 4:3 picture when there is one wide enough, else as the screen allows
+      const margin = (innerWidth - innerHeight * 4 / 3) / 2;
+      const fit = margin > 140 ? (margin - 16) / 2.7 : r.height * 0.17;
+      const gap = Math.max(50, Math.min(88, fit, r.height * 0.2));
+      const size = gap * 0.92;
+      const cx = r.width - gap * 1.6 - 12, cy = r.height - gap * 1.6 - 12;
+      for (const { e, spec } of els) {
+        const s = spec.label.includes('+') ? size * 0.72 : size;
+        Object.assign(e.style, { width: `${s}px`, height: `${s}px`, left: `${cx + spec.dx * gap - s / 2}px`, top: `${cy + spec.dy * gap - s / 2}px` });
+        spec.cx = r.left + cx + spec.dx * gap; spec.cy = r.top + cy + spec.dy * gap; spec.r = s * 0.62;
+      }
+    }
+    // the pad's box: the visible viewport (a browser's bars come and go)
+    const vv = window.visualViewport;
+    const fitPad = () => {
+      if (vv) Object.assign(pad.style, { top: `calc(${vv.offsetTop}px + env(safe-area-inset-top))`, height: `calc(${vv.height}px - env(safe-area-inset-top) - env(safe-area-inset-bottom))`, bottom: 'auto' });
+      layout();
+    };
+    vv?.addEventListener('resize', fitPad); vv?.addEventListener('scroll', fitPad);
+    addEventListener('resize', fitPad); fitPad();
+    // the browser's own bars away: full screen on the first touch where the page may ask (Android); on an iPhone,
+    // which has none for a page, the way that has (the home screen icon)
+    const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    const full = () => {
+      const el = document.documentElement;
+      if (!document.fullscreenElement && el.requestFullscreen) el.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+    };
+    addEventListener('touchend', full, { once: true });
+    if (!document.documentElement.requestFullscreen && !standalone && /iP(hone|od)/.test(navigator.userAgent)) {
+      const tip = document.getElementById('tip'); tip.style.display = 'block';
+      setTimeout(() => { tip.style.display = 'none'; }, 8000);
+      tip.addEventListener('pointerdown', () => { tip.style.display = 'none'; });
+    }
+
+    const buzz = () => { if (navigator.vibrate) navigator.vibrate(8); };
+    const pointers = new Map();   // pointer id -> { kind: 'stick' | 'buttons' | 'sys', ... }
+    function update() {
+      const was = held.slice();
+      held.fill(false);
+      for (const p of pointers.values()) for (const b of p.buttons) held[b] = true;
+      for (const { e, spec } of els) e.classList.toggle('on', spec.b.every((b) => held[b]));
+      for (const s of sys) s.e.classList.toggle('on', held[s.b]);
+      if (held.some((h, i) => h && !was[i] && i < 12)) buzz();
+    }
+    // the stick: where the finger lands is its centre; 8 ways past a dead zone
+    function stick(p, x, y) {
+      const dx = x - p.x0, dy = y - p.y0, d = Math.hypot(dx, dy), max = 50;
+      const k = d > max ? max / d : 1;
+      knob.style.left = `${p.x0 + dx * k}px`; knob.style.top = `${p.y0 + dy * k}px`;
+      p.buttons = [];
+      if (d > 18) {
+        const a = Math.atan2(dy, dx), oct = Math.round(a / (Math.PI / 4));
+        const dirs = { 0: [B.right], 1: [B.right, B.down], 2: [B.down], 3: [B.down, B.left], 4: [B.left], '-4': [B.left],
+                       '-3': [B.left, B.up], '-2': [B.up], '-1': [B.up, B.right] };
+        p.buttons = dirs[oct];
+      }
+    }
+    // a finger on the buttons: the button(s) under it (a pair, or two faces when between them)
+    function under(x, y) {
+      const hit = els.filter(({ spec }) => Math.hypot(x - spec.cx, y - spec.cy) < spec.r);
+      return [...new Set(hit.flatMap(({ spec }) => spec.b))];
+    }
+    const down = (kind) => (ev) => {
+      ev.preventDefault();
+      ev.currentTarget.setPointerCapture?.(ev.pointerId);
+      if (kind === 'stick') {
+        const p = { kind, x0: ev.clientX, y0: ev.clientY, buttons: [] };
+        const lr = left.getBoundingClientRect();
+        ring.hidden = knob.hidden = false;
+        ring.style.left = `${ev.clientX - lr.left}px`; ring.style.top = `${ev.clientY - lr.top}px`;
+        p.x0 -= lr.left; p.y0 -= lr.top;
+        pointers.set(ev.pointerId, p); stick(p, ev.clientX - lr.left, ev.clientY - lr.top);
+      } else {
+        pointers.set(ev.pointerId, { kind, buttons: kind.b !== undefined ? [kind.b] : under(ev.clientX, ev.clientY) });
+      }
+      update();
+    };
+    const move = (ev) => {
+      const p = pointers.get(ev.pointerId);
+      if (!p) return;
+      ev.preventDefault();
+      if (p.kind === 'stick') { const lr = left.getBoundingClientRect(); stick(p, ev.clientX - lr.left, ev.clientY - lr.top); }
+      else if (p.kind === 'buttons') p.buttons = under(ev.clientX, ev.clientY);
+      update();
+    };
+    const up = (ev) => {
+      const p = pointers.get(ev.pointerId);
+      if (!p) return;
+      pointers.delete(ev.pointerId);
+      if (p.kind === 'stick') ring.hidden = knob.hidden = true;
+      update();
+    };
+    left.addEventListener('pointerdown', down('stick'));
+    right.addEventListener('pointerdown', down('buttons'));
+    for (const s of sys) s.e.addEventListener('pointerdown', down({ b: s.b }));
+    for (const t of [left, right, ...sys.map((s) => s.e)]) {
+      t.addEventListener('pointermove', move);
+      t.addEventListener('pointerup', up);
+      t.addEventListener('pointercancel', up);
+      t.addEventListener('lostpointercapture', up);
+    }
+    // no long-press menu, no scrolling the page
+    addEventListener('contextmenu', (e) => e.preventDefault());
+    document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+  }
+  if (matchMedia('(pointer: coarse)').matches || location.hash === '#touch') setupPad();
+  addEventListener('touchstart', setupPad, { once: true, passive: true });
+
+  // ---- the files the game reads (kumite_fs, crates/kumite_fs): fetched without blocking, kept here for its reads. The game asks
+  // ahead for what it will need (prefetch), takes it (get), reads a movie as it arrives (read); a file it reads
+  // without asking comes by a synchronous request and is kept here too (put). Old files go past the budget.
+  // The converted files may be here (kumite_converter's UNIVERSAL.md §6), each a Blob read only as needed (local: path below assets/ ->
+  // Blob): a folder on the disk (Chrome, Edge: File System Access; written by kumite_converter's convert.html or its CLI, the
+  // same tree), or a conversion made in this browser and kept in OPFS as assets.pack, the files' bytes, and
+  // assets.idx, {"version": 1, "files": {"path": [offset, length]}} (slices of the pack). With them, the assets/ URLs
+  // read those, and a synchronous read or a sound takes a blob: URL of one (src).
+  let local = null;
+  window.__okfs = (() => {
+    const files = new Map();
+    const blobs = new Map();
+    const packed = (url) => local && url.startsWith('assets/') ? local.get(url.slice(7)) ?? null : undefined;
+    const BUDGET = 256e6;
+    let held = 0;
+    const now = () => performance.now();
+    const evict = () => {
+      if (held <= BUDGET) return;
+      const old = [...files.entries()].filter(([, e]) => e.done).sort((a, b) => a[1].used - b[1].used);
+      for (const [url, e] of old) { if (held <= BUDGET) break; files.delete(url); held -= e.got; }
+    };
+    // at most 8 at once (a small server drops a burst of connections); a network error is tried again
+    const queue = [];
+    let active = 0;
+    const pump = () => {
+      while (active < 8 && queue.length) {
+        const [url, e] = queue.shift();
+        active++;
+        load(url, e, 0).finally(() => { active--; pump(); });
+      }
+    };
+    const load = async (url, e, attempt) => {
+      // (forgotten, or started again, meanwhile: not fetched)
+      if (files.get(url) !== e) return;
+      let r;
+      const at = packed(url);
+      try {
+        r = at === undefined ? await fetch(url)
+          : at ? new Response(at, { headers: { 'x-size': at.size } }) : new Response(null, { status: 404 });
+      } catch (err) {
+        if (attempt < 4) { await new Promise((ok) => setTimeout(ok, 200 * (attempt + 1))); return load(url, e, attempt + 1); }
+        e.failed = true; return;
+      }
+      if (!r.ok) { e.failed = true; return; }
+      e.t0 = now();
+      // the size as stored (a compressed transfer's length is not; the server says it in X-Size)
+      e.total = +r.headers.get('x-size') || (r.headers.get('content-encoding') ? 0 : +r.headers.get('content-length')) || 0;
+      e.buf = new Uint8Array(e.total || 1 << 20);
+      e.got = 0;
+      try {
+        const reader = r.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (e.got + value.length > e.buf.length) {
+            const b = new Uint8Array(Math.max(e.buf.length * 2, e.got + value.length));
+            b.set(e.buf.subarray(0, e.got)); e.buf = b;
+          }
+          e.buf.set(value, e.got); e.got += value.length;
+        }
+      } catch (err) {
+        if (attempt < 4) return load(url, e, attempt + 1);
+        e.failed = true; return;
+      }
+      if (e.buf.length !== e.got) e.buf = e.buf.slice(0, e.got);
+      e.done = true; e.t1 = now();
+      if (files.get(url) === e) { held += e.got; evict(); }
+    };
+    const start = (url) => {
+      const e = { buf: new Uint8Array(0), got: 0, total: 0, done: false, failed: false, t0: now(), used: now() };
+      files.set(url, e);
+      queue.push([url, e]);
+      pump();
+    };
+    return {
+      // (one that failed is tried again)
+      prefetch(url) { if (!files.has(url) || files.get(url).failed) start(url); },
+      // 0 absent, 1 arriving, 2 here, 3 failed
+      state(url) { const e = files.get(url); return !e ? 0 : e.failed ? 3 : e.done ? 2 : 1; },
+      get(url) { const e = files.get(url); if (e && e.done) { e.used = now(); return e.buf; } },
+      put(url, bytes) { const old = files.get(url); if (!old || old.failed) { files.set(url, { buf: bytes, got: bytes.length, total: bytes.length, done: true, used: now() }); held += bytes.length; evict(); } },
+      read(url, from) {
+        const e = files.get(url);
+        if (!e) return { failed: true };
+        e.used = now();
+        const secs = ((e.done ? e.t1 : now()) - e.t0) / 1000;
+        return { bytes: e.buf.subarray(from, e.got), done: e.done, failed: e.failed, total: e.total, rate: secs > 0.05 ? e.got / secs : 0 };
+      },
+      forget(url) {
+        const e = files.get(url); if (e) { files.delete(url); if (e.done) held -= e.got; }
+        const b = blobs.get(url); if (b) { blobs.delete(url); URL.revokeObjectURL(b); }
+      },
+      // with local files: the file's blob: URL (made once), and whether it is there (a blob: URL answers no HEAD);
+      // without: undefined (the server's URL)
+      src(url) {
+        const at = packed(url);
+        if (at && !blobs.has(url)) blobs.set(url, URL.createObjectURL(at));
+        return blobs.get(url);
+      },
+      has(url) { const at = packed(url); return at === undefined ? undefined : !!at; },
+      // still arriving: bytes so far, bytes expected, files
+      progress() {
+        let got = 0, total = 0, n = 0;
+        for (const e of files.values()) if (!e.done && !e.failed) { got += e.got; total += e.total; n++; }
+        return [got, total, n];
+      },
+    };
+  })();
+
+  // ---- start: the game and the files its start reads (web/preload.json: [path, size]), with a bar; then the game
+  // (pkg/version.txt, never cached, names this build: the game's two halves are fetched by it, so a browser never
+  // keeps an old copy, which other players would refuse as another build, or mixes two builds' halves)
+  let version = '';
+  try {
+    const r = await fetch('pkg/version.txt', { cache: 'no-store' });
+    if (r.ok) version = (await r.text()).trim();
+  } catch (e) { /* none */ }
+  let init;
+  try {
+    ({ default: init } = await import(`./pkg/openkumite.js?v=${version}`));
+  } catch (e) {
+    document.getElementById('loading').remove();
+    fail(`The game did not load (${e}): reload the page.`);
+    throw e;
+  }
+  const WASM = `pkg/openkumite_bg.wasm?v=${version}`;
+  // the files, from the first of: a converted folder on the disk, the browser's own conversion, the server's assets
+  // (each finished: manifest.json is written last)
+  const AUDIO = { flac: 'audio/flac', wav: 'audio/wav', mp3: 'audio/mpeg' };
+  const typed = (path, blob, at = 0, n = blob.size) => blob.slice(at, at + n, AUDIO[path.split('.').pop()] ?? '');
+  // the folder's handle in IndexedDB (as kumite_converter's convert.html keeps it, under the same names)
+  const idb = (op, ...a) => new Promise((ok, no) => {
+    const r = indexedDB.open('openkumite', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('handles');
+    r.onerror = () => no(r.error);
+    r.onsuccess = () => {
+      const q = r.result.transaction('handles', op === 'get' ? 'readonly' : 'readwrite').objectStore('handles')[op](...a);
+      q.onsuccess = () => ok(q.result);
+      q.onerror = () => no(q.error);
+    };
+  });
+  // a question on the page, answered by a click (the browser asks for a folder's access only from one): what the
+  // button clicked gives (no buttons: never)
+  const choose = (html, buttons) => new Promise((done) => {
+    const box = document.createElement('div');
+    box.innerHTML = html;
+    for (const [label, act] of buttons) {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.onclick = async () => {
+        box.remove();
+        done(await act().catch((e) => { if (e?.name !== 'AbortError') fail(`${e?.name}: ${e?.message}`); return null; }));
+      };
+      box.append(' ', b);
+    }
+    document.getElementById('error').append(box);
+  });
+  // a converted folder's files, as Files (they read from the disk only when read), or null without manifest.json
+  const folderFiles = async (dir) => {
+    const t0 = performance.now();
+    const found = [];
+    const walk = async (d, prefix) => {
+      const below = [];
+      for await (const [name, e] of d.entries()) {
+        if (e.kind === 'directory') below.push(walk(e, `${prefix}${name}/`));
+        else found.push(e.getFile().then((f) => [prefix + name, typed(name, f)]));
+      }
+      await Promise.all(below);
+    };
+    await walk(dir, '');
+    const map = new Map(await Promise.all(found));
+    console.info(`the folder ${dir.name}: ${map.size} files in ${Math.round(performance.now() - t0)} ms`);
+    return map.has('manifest.json') ? map : null;
+  };
+  // Chrome, Edge: a folder picked here is remembered, as one kumite_converter's convert.html wrote into
+  const pick = window.showDirectoryPicker && (async () => {
+    const dir = await showDirectoryPicker({ id: 'openkumite' });
+    const files = await folderFiles(dir);
+    if (!files) fail(`No converted game in the folder "${dir.name}" (no manifest.json): pick the folder the converter wrote.`);
+    else await idb('put', dir, 'folder').catch(() => {});
+    return files;
+  });
+  let folder = pick ? await idb('get', 'folder').catch(() => null) : null;
+  if (folder && (await folder.queryPermission({ mode: 'read' }).catch(() => 'denied')) !== 'granted') {
+    // (on a later visit the browser asks again)
+    const name = folder.name.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
+    folder = await choose(`The game is in the folder "${name}" on this computer.`, [
+      ['Open it', async () => ((await folder.requestPermission({ mode: 'read' })) === 'granted' ? folder : null)],
+      ['Not now', async () => null]]);
+  }
+  try {
+    if (folder) local = await folderFiles(folder);
+  } catch (e) { fail(`Cannot read the folder "${folder.name}" (${e.message}).`); }
+  if (!local) {
+    try {
+      const dir = await navigator.storage.getDirectory();
+      const file = await (await dir.getFileHandle('assets.pack')).getFile();
+      const idx = JSON.parse(await (await (await dir.getFileHandle('assets.idx')).getFile()).text());
+      // (an entry past the pack's end is left out: its reads say not found)
+      const ok = ([at, n]) => Number.isSafeInteger(at) && Number.isSafeInteger(n) && at >= 0 && n >= 0 && at + n <= file.size;
+      const map = new Map(Object.entries(idx?.files ?? {}).filter(([, v]) => Array.isArray(v) && ok(v)));
+      if (idx?.version === 1 && map.has('manifest.json')) local = new Map([...map].map(([p, [at, n]]) => [p, typed(p, file, at, n)]));
+    } catch (e) { /* none (or no OPFS: a private window) */ }
+  }
+  if (!local && !(await fetch('assets/manifest.json', { method: 'HEAD' }).then((r) => r.ok, () => false))) {
+    const loading = document.getElementById('loading');
+    loading.hidden = true;
+    const text = 'No converted game here. Convert your game disc with kumite_converter (its browser page or CLI) first';
+    while (!local) local = await choose(pick ? `${text}, or open a folder converted before:` : `${text}.`, pick ? [['Open converted game folder…', pick]] : []);
+    document.getElementById('error').textContent = '';
+    loading.hidden = false;
+  }
+  let preload = [];
+  if (!location.hash.includes('nopreload')) {
+    try { preload = await (await fetch('preload.json')).json(); } catch (e) { /* none: everything as read */ }
+  }
+  const wanted = [[WASM, 0], ...preload];
+  for (const [url] of wanted) __okfs.prefetch(url);
+  const fill = document.querySelector('#loading .fill');
+  const expected = wanted.reduce((a, [, size]) => a + (size || 0), 0);
+  await new Promise((done) => {
+    const step = () => {
+      let got = 0, waiting = false;
+      for (const [url, size] of wanted) {
+        const r = __okfs.read(url, 0);
+        got += r.done ? (size || r.bytes.length) : Math.min(r.bytes.length, size || r.bytes.length);
+        if (!r.done && !r.failed) waiting = true;
+        if (url === WASM && r.total) wanted[0][1] = r.total;
+      }
+      const all = wanted.reduce((a, [, size]) => a + (size || 0), 0) || expected || 1;
+      fill.style.width = `${Math.min(100, 100 * got / all)}%`;
+      if (waiting) setTimeout(step, 50); else done();
+    };
+    step();
+  });
+  document.getElementById('loading').remove();
+  const wasm = __okfs.get(WASM);
+  __okfs.forget(WASM);
+  // (not fetched ahead: by its versioned name, not the glue's own guess without the version)
+  init({ module_or_path: wasm ?? WASM }).then(() => {
+    // the canvas winit adds takes the keyboard once clicked
+    const focus = () => { const c = document.querySelector('canvas'); if (c) { c.tabIndex = 0; c.focus(); } };
+    document.addEventListener('click', focus);
+    setTimeout(focus, 500);
+  }).catch((e) => fail(`The game did not start (${e}): reload the page.`));
+</script>
+</body>
+</html>

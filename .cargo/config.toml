@@ -1,0 +1,4 @@
+# Standalone Windows binaries (.github/workflows/release.yml): the C runtime linked in, so no VC++ redistributable is
+# needed.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

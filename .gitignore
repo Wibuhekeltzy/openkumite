@@ -1,0 +1,33 @@
+/target
+
+# Converted game assets (kumite_converter's output: copyrighted game data)
+/assets
+
+# Disc images (copyrighted game data)
+*.bin
+*.cue
+*.iso
+*.img
+*.chd
+*.ecm
+*.pbp
+
+# OS
+.DS_Store
+
+# Written by the debug tools (F12 screenshots show game imagery; input recordings)
+openkumite_screenshots/
+openkumite_recordings/
+openkumite_demos/
+
+# the save's backup, temporary and set-aside copies (save.rs)
+openkumite_save.json.bak
+openkumite_save.json.tmp
+openkumite_save.json.bak.tmp
+openkumite_save.json.corrupt-*
+
+# a save written here (OPENKUMITE_SAVE_DIR=.)
+openkumite_save.json
+
+# agents' git worktrees
+.claude/worktrees/

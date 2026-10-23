@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = ["crates/kumite_fs", "crates/kumite_assets", "crates/kumite_game", "crates/kumite_sim", "crates/kumite_render", "crates/kumite_net", "crates/serve", "app"]
+exclude = ["fuzz"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+version = "0.1.0"
+
+[workspace.dependencies]
+kumite_assets = { path = "crates/kumite_assets" }
+kumite_sim = { path = "crates/kumite_sim" }
+kumite_game = { path = "crates/kumite_game" }
+kumite_render = { path = "crates/kumite_render" }
+kumite_fs = { path = "crates/kumite_fs" }
+kumite_net = { path = "crates/kumite_net" }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+glam = { version = "0.34", features = ["bytemuck", "libm", "scalar-math"] }
+bytemuck = { version = "1", features = ["derive"] }
+wgpu = { version = "30", features = ["webgl"] }
+winit = { version = "0.30", features = ["serde"] }
+pollster = "1"
+png = "0.18"
+gltf = { version = "1.4", features = ["import", "names", "extras"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The lints every crate takes (`[lints] workspace = true`): no unsafe code but the macOS haptics' FFI (allowed
+# there); nothing that panics in the game's code on what comes from outside (it must never crash; tests may).
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+
+[profile.dev]
+opt-level = 1          # decoding and skinning are too slow unoptimised
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# the release binaries (.github/workflows/release.yml): one standalone file per platform, smaller and a little faster
+# (whole-program optimisation, no symbols); .cargo/config.toml links Windows' C runtime in
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# the browser build (web/build.sh): as dist
+[profile.web]
+inherits = "dist"
+
+# matchbox_socket with rustls for wss signalling (vendor/matchbox_socket/Cargo.toml says why)
+[patch.crates-io]
+matchbox_socket = { path = "vendor/matchbox_socket" }
+
+# ggrs reckons the ping from a peer's quality reply with plain arithmetic: a lying one overflows, a panic where
+# overflow is checked (release builds wrap, harmlessly)
+[profile.dev.package.ggrs]
+overflow-checks = false
