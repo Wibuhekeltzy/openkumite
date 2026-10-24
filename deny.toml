@@ -8,6 +8,8 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1: ggrs's message encoding (the rollback packets use it too)" },
     { id = "RUSTSEC-2024-0384", reason = "instant: ggrs's timer" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser: egui's font loading (our own embedded fonts only)" },
+    # a vulnerability with no fix reachable yet: drop when webrtc's dtls takes a crypto-bigint >= 0.7.6
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (timing leaks): webrtc's DTLS handshake (p256/p384) in online play; no 0.5 fix, dtls needs elliptic-curve 0.13" },
 ]
 
 [licenses]
