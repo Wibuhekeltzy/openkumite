@@ -71,11 +71,11 @@ fn places(env: &dyn Fn(&str) -> Option<OsString>, exe: Option<&Path>, os: &str) 
     out
 }
 
-#[cfg(test)]
+// (its paths are unix ones)
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)] // (its paths are unix ones)
     #[test]
     fn the_first_place_with_a_conversion() {
         let root = std::env::temp_dir().join(format!("openkumite_assetdir_test_{}", std::process::id()));
