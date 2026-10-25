@@ -51,6 +51,7 @@ mod debug;
 mod demo;
 #[cfg(not(target_arch = "wasm32"))]
 mod direct;
+mod files;
 mod forcerun;
 #[cfg(not(target_arch = "wasm32"))]
 mod gamepad;
@@ -71,12 +72,18 @@ mod online;
 mod onlinemenu;
 mod practice;
 mod records;
+mod replay;
+mod replay_view;
 mod room;
 #[cfg(target_os = "macos")]
 mod rumble_mac;
 mod save;
 mod tagrun;
 mod theater;
+#[cfg(not(target_arch = "wasm32"))]
+mod video;
+#[cfg(not(target_arch = "wasm32"))]
+mod video_export;
 
 use anyhow::{Context, Result};
 use art::Art;
@@ -97,6 +104,9 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+/// A tag brawl is over for its replay this many steps into its end (`step_tag`'s wait before the next screen).
+const TAG_SAVED_AFTER: u32 = 150;
 
 /// The game logic runs at a fixed 60 steps per second (one step per NTSC field, kumite_converter's reference engine.md
 /// §2.3).
@@ -225,6 +235,12 @@ fn apply_face(r: &Renderer, model: &SkinnedModel, atlas: &kumite_assets::Image, 
             }
         }
     }
+}
+
+/// What made a match being recorded as a replay (`replay.rs`).
+struct ReplayRec {
+    game: replay::Match,
+    online: bool,
 }
 
 /// The fight being played.
@@ -396,6 +412,8 @@ struct App {
     /// select and the matches run over it until one leaves.
     /// `--mode`: what to start once the renderer is there.
     pending_launch: Option<launch::LaunchSpec>,
+    /// `--replay ID|latest`: a replay to watch once the renderer is there.
+    pending_replay: Option<String>,
     /// A fight (or a tag match) waiting for its files to arrive (a browser), started once they have.
     waiting: Option<Waiting>,
     gamepads: Option<gamepad::Gamepads>,
@@ -420,6 +438,30 @@ struct App {
     /// The session recorded as a demo (`--debug` / `--record-demo`), where `--record-demo` saves it, and a demo
     /// being played (`--demo`).
     demo_rec: Option<demo::DemoFile>,
+    /// The match being recorded as a replay (its inputs are its bout's tape): what made it.
+    replay_rec: Option<ReplayRec>,
+    /// A replay about to load: `load` builds its match from the replay's parameters, not the mode's.
+    replay_next: Option<Box<(replay::Entry, Arc<[kumite_game::bout::StepInput]>)>>,
+    /// A replay being watched.
+    replay_view: Option<Box<replay_view::View>>,
+    /// The camera counters before the replay about to load (put back after it).
+    replay_counters_before: Option<[usize; 3]>,
+    /// A Force replay's players joining (the step before which, who), and the next one to come.
+    replay_joins: Vec<(u64, u8)>,
+    replay_join_next: usize,
+    /// Joins replayed out of sight (the run-through, a seek): without their sound.
+    replay_quiet: bool,
+    /// The tag stage before a tag brawl's replay set its own (put back after it).
+    replay_tag_stage: Option<Option<usize>>,
+    /// The replays, open over the main menu.
+    replays: Option<replay_view::Browser>,
+    /// Keys are the game's again from then (a system dialog closed with one).
+    keys_after: Option<Instant>,
+    /// A replay to make a video of: its options being asked, and the export running (or just done).
+    #[cfg(not(target_arch = "wasm32"))]
+    video_dialog: Option<video_export::Dialog>,
+    #[cfg(not(target_arch = "wasm32"))]
+    video_export: Option<video_export::Export>,
     demo_out: Option<std::path::PathBuf>,
     demo_play: Option<demo::Playback>,
     /// Rewind buffer: the fight after each step (`--debug`), newest last; and the quick-saved fight.
@@ -503,11 +545,23 @@ impl App {
         // Ball fall through the air table
         game.ko_collapse = !matches!(setup.as_ref().map(|s| s.mode), Some(Mode::Practice | Mode::Watch | Mode::Ball));
         game.fight.ko_collapse = game.ko_collapse;
-        // testing: `--round-time SECONDS`, `--rounds N`
-        if let Some(t) = self.round_time {
+        // testing: `--round-time SECONDS`, `--rounds N` (not in an online room: each computer has its own command
+        // line, and the match must be the same match on all)
+        let testing = self.room.is_none();
+        if let Some(t) = self.round_time.filter(|_| testing) {
             game.round_frames = t * 60;
         }
-        let rounds = self.rounds.unwrap_or(rounds);
+        let mut rounds = self.rounds.filter(|_| testing).unwrap_or(rounds);
+        // a replay: the match as it was recorded (its parameters, not the mode's now), the camera counters as then
+        let replaying = self.replay_next.as_ref().and_then(|n| match &n.0.file.game {
+            replay::Match::Fight { params, .. } => Some(*params),
+            _ => None,
+        });
+        if let Some(p) = replaying {
+            (rounds, game.round_frames, game.max_health, game.start_health) = (p.rounds, p.round_frames, p.max_health, p.start_health);
+            kumite_game::bout::set_counters(p.counters);
+        }
+        let (counters, round_frames, max_health, start_health) = (kumite_game::bout::counters(), game.round_frames, game.max_health, game.start_health);
         let mut bout = Bout::new(game, self.ai.clone(), rounds, setup.is_some());
         match setup.as_ref().map(|s| s.mode) {
             None => bout = bout.free_fight(),
@@ -559,6 +613,21 @@ impl App {
             Some(Mode::Practice) => {
                 bout = bout.free_fight();
             }
+        }
+        if let (Some(p), Some(s)) = (replaying, setup.as_ref()) {
+            for k in 0..2 {
+                bout.set_cpu(k, p.cpu[k].then_some((s.difficulty, s.level)));
+            }
+            bout.interlude_check = p.interlude_check;
+        }
+        // every match of a mode with rounds is recorded (its inputs on the bout's tape), saved as a replay at its end
+        let recordable = matches!(setup.as_ref().map(|s| s.mode), Some(Mode::Arcade | Mode::Versus | Mode::TeamBattle | Mode::TimeAttack | Mode::Survival | Mode::Ball | Mode::ExtraLevels));
+        self.replay_rec = None;
+        if let (None, true, Some(s)) = (replaying, recordable, setup.as_ref()) {
+            bout.tape = Some(Default::default());
+            let params = replay::MatchParams { rounds, round_frames, max_health, start_health, cpu: [bout.cpu[0].is_some(), bout.cpu[1].is_some()], interlude_check: bout.interlude_check, counters };
+            let game = replay::Match::Fight { setup: s.clone(), params, ladder: ladder.clone() };
+            self.replay_rec = Some(ReplayRec { game, online: self.net.is_some() || self.room.is_some() });
         }
         log::info!("{:?} fight {} vs {} on stage {stage} loaded in {:.0} ms", setup.as_ref().map(|s| s.mode), names[0], names[1], t.elapsed().as_secs_f32() * 1000.0);
         let banks = models.map(|m| format!("m{m:03}"));
@@ -652,8 +721,189 @@ impl App {
             (f.partner, f.extra_voice) = (Some(voice(partners.partners[0])), Some(voice(partners.partners[1])));
             f.seats = Some(partners.seats);
         }
+        self.begin_replay();
         self.screen = None;
         Ok(())
+    }
+
+    /// A replay's match just loaded (a fight, a tag brawl, a Force stage): its inputs play it, and it is run
+    /// through once first (the seek copies, the rounds, the check).
+    fn begin_replay(&mut self) {
+        let Some(next) = self.replay_next.take() else { return };
+        let (entry, inputs) = *next;
+        if let Some(t) = self.tag.as_mut() {
+            t.game.play(inputs);
+        } else if let Some(f) = self.fight.as_mut() {
+            f.bout.play(inputs);
+        } else {
+            return;
+        }
+        let before = self.replay_counters_before.take().unwrap_or_else(kumite_game::bout::counters);
+        self.replay_view = Some(Box::new(replay_view::View::new(entry, before)));
+        self.replay_join_next = 0;
+        let t = Instant::now();
+        self.replay_prepare();
+        log::info!("replay run through in {:.0} ms", t.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    /// The match being recorded was changed by a cheat or a debug tool: its inputs no longer make it, so it is not
+    /// saved as a replay.
+    fn spoil_replay(&mut self, why: &str) {
+        if self.replay_rec.take().is_some() {
+            log::info!("this match is not saved as a replay: {why}");
+        }
+    }
+
+    /// A replay at its end: it stops there (paused), checked once against the recorded state.
+    fn replay_ended(&mut self) {
+        let hash = self.match_hash();
+        if let Some(v) = self.replay_view.as_mut() {
+            if !v.ended {
+                v.ended = true;
+                v.watched_ok = Some(hash == v.file.hash);
+                log::info!("replay {}: watched to its end, the state as recorded: {:?}", v.id, v.watched_ok);
+            }
+        }
+        self.debug.paused = true;
+    }
+
+    /// The replay's match as it is now (a seek's copy).
+    fn replay_snapshot(&self) -> Option<replay_view::Snapshot> {
+        use replay_view::Snapshot as S;
+        if let Some(t) = self.tag.as_ref() {
+            return Some(S::Tag(Box::new(t.game.clone())));
+        }
+        let f = self.fight.as_ref()?;
+        Some(match self.force.as_ref().filter(|_| self.force_fight()) {
+            Some(run) => S::Force(Box::new(f.bout.clone()), Box::new(run.clone())),
+            None => S::Fight(Box::new(f.bout.clone())),
+        })
+    }
+
+    fn replay_restore(&mut self, snap: replay_view::Snapshot) {
+        use replay_view::Snapshot as S;
+        match snap {
+            S::Tag(g) => {
+                if let Some(t) = self.tag.as_mut() {
+                    t.game = *g;
+                }
+            }
+            S::Fight(b) => {
+                if let Some(f) = self.fight.as_mut() {
+                    f.bout = *b;
+                }
+            }
+            S::Force(b, run) => {
+                if let Some(f) = self.fight.as_mut() {
+                    f.bout = *b;
+                }
+                self.force = Some(*run);
+            }
+        }
+        // (the joins still to come: from this step on)
+        let at = self.replay_played() as u64;
+        self.replay_join_next = replay::joins_to_come(&self.replay_joins, at);
+    }
+
+    /// The steps the replay has played.
+    fn replay_played(&self) -> usize {
+        match (self.tag.as_ref(), self.fight.as_ref()) {
+            (Some(t), _) => t.game.played(),
+            (None, Some(f)) => f.bout.played(),
+            _ => 0,
+        }
+    }
+
+    /// The replay's match is at its end (where it was recorded to).
+    fn replay_finished(&self) -> bool {
+        match (self.tag.as_ref(), self.fight.as_ref()) {
+            (Some(t), _) => t.game.finished() && t.game.phase_frame >= TAG_SAVED_AFTER,
+            (None, Some(f)) => f.bout.finished(),
+            _ => true,
+        }
+    }
+
+    /// The state hash a replay is checked by: the bout's or the tag brawl's.
+    fn match_hash(&self) -> u64 {
+        match (self.tag.as_ref(), self.fight.as_ref()) {
+            (Some(t), _) => t.game.state_hash(),
+            (None, Some(f)) => f.bout.game.state_hash(),
+            _ => 0,
+        }
+    }
+
+    /// The round on: the bout's, the tag brawl's.
+    fn match_round(&self) -> u32 {
+        match (self.tag.as_ref(), self.fight.as_ref()) {
+            (Some(t), _) => t.game.round,
+            (None, Some(f)) => f.bout.round,
+            _ => 0,
+        }
+    }
+
+    /// A Force replay's players joining before this step.
+    fn replay_joins_due(&mut self) {
+        let at = self.replay_played() as u64;
+        while let Some(&(step, who)) = self.replay_joins.get(self.replay_join_next) {
+            if !replay::join_due((step, who), at) {
+                break;
+            }
+            self.replay_join_next += 1;
+            match who {
+                1 => self.join_force_partner(),
+                p => self.join_force_player(usize::from(p)),
+            }
+        }
+    }
+
+    /// One step of the replay's match, without its sounds and effects (the run-through, a seek): the fight's or the
+    /// tag brawl's, a Force stage's logic after it.
+    fn replay_sim_step(&mut self) {
+        if let Some(t) = self.tag.as_mut() {
+            t.game.step([Pad::default(); 4]);
+            return;
+        }
+        self.replay_quiet = true;
+        self.replay_joins_due();
+        self.replay_quiet = false;
+        let Some(f) = self.fight.as_mut() else { return };
+        f.bout.step([Pad::default(); 2]);
+        if self.force_fight() {
+            let (Some(run), Some(f)) = (self.force.as_mut(), self.fight.as_mut()) else { return };
+            let ctx = ForceCtx::of(run);
+            if let Some(st) = run.stage.as_mut() {
+                let _ = force_sim(&self.roster, &self.assets, &self.actor_cache, &ctx, &mut f.bout, st, false);
+            }
+        }
+    }
+
+    /// The run-through: the match played to its end once, a copy kept every so often and the rounds' starts
+    /// noted, its end checked against the recorded state; then back to its start.
+    fn replay_prepare(&mut self) {
+        let Some(total) = self.replay_view.as_ref().map(|v| v.total) else { return };
+        let Some(start) = self.replay_snapshot() else { return };
+        let (mut snaps, mut rounds, mut round) = (vec![(0, start.clone())], Vec::new(), 0);
+        for step in 0..total {
+            if step > 0 && step % replay_view::SNAPSHOT_EVERY == 0 {
+                if let Some(s) = self.replay_snapshot() {
+                    snaps.push((step, s));
+                }
+            }
+            self.replay_sim_step();
+            let r = self.match_round();
+            if r != round {
+                round = r;
+                rounds.push((step, r));
+            }
+        }
+        let verified = self.replay_view.as_ref().is_some_and(|v| self.match_hash() == v.file.hash);
+        if !verified {
+            log::warn!("the replay's run-through ended in another state than recorded");
+        }
+        self.replay_restore(start);
+        if let Some(v) = self.replay_view.as_mut() {
+            (v.snapshots, v.rounds, v.verified) = (snaps, rounds, verified);
+        }
     }
 
     /// A stage's meshes and the effect atlas (no fighters yet).
@@ -721,7 +971,10 @@ impl App {
 
     /// A menu is open (a screen, a pause, practice's menu, a match's end): the keys move its cursor, not a fighter.
     fn in_menu(&self) -> bool {
+        // (a replay playing and the replays' list: their controls are the menu keys)
         self.screen.is_some()
+            || self.replays.is_some()
+            || self.replay_view.is_some()
             || self.tag.as_ref().is_some_and(|t| t.pause.is_some())
             || self.fight.as_ref().is_some_and(|f| f.pause.is_some() || f.practice.as_ref().is_some_and(|p| p.open) || matches!(f.bout.phase, Phase::MatchOver { .. }))
     }
@@ -820,6 +1073,10 @@ impl App {
 
     /// One fixed 60 Hz logic step.
     fn step(&mut self) {
+        // a save that failed (a full disk, the browser's storage full): the player is told, once each time
+        if let Some(why) = save::take_failure() {
+            self.debug.say(why);
+        }
         // a fight whose files were still arriving: started once all are here
         if let Some(w) = self.waiting.take() {
             match w {
@@ -832,6 +1089,13 @@ impl App {
             self.step_online();
         }
         if self.renderer.is_some() {
+            if let Some(id) = self.pending_replay.take() {
+                let all = replay::list();
+                match all.into_iter().find(|e| e.id == id || id == "latest") {
+                    Some(e) => self.play_replay(e),
+                    None => log::error!("--replay {id}: no such replay"),
+                }
+            }
             if let Some(spec) = self.pending_launch.take() {
                 self.launch(spec);
             }
@@ -842,6 +1106,10 @@ impl App {
         self.rumble_tick();
         let step_no = self.logic_steps;
         self.logic_steps += 1;
+        // a Force replay: its players joining before this step
+        if self.replay_view.is_some() && self.force_fight() {
+            self.replay_joins_due();
+        }
         // a demo: the keys and cheats recorded before this step
         if let Some(pb) = self.demo_play.as_mut() {
             let events = pb.events(step_no);
@@ -954,7 +1222,8 @@ impl App {
                 }
             }
             let was_playing = matches!(screen, Screen::Movie(m, _) if m.playing);
-            let outcome = screen.tick(&self.roster, &mut self.seed);
+            // (the main menu waits while the replays are open over it: no idle return to the title)
+            let outcome = if self.replays.is_some() && matches!(screen, Screen::Menu(_)) { Outcome::None } else { screen.tick(&self.roster, &mut self.seed) };
             // a movie's soundtrack starts with its pictures (once enough of it has arrived)
             if let (Screen::Movie(m, _), false, Some(audio)) = (&*screen, was_playing, self.audio.as_mut()) {
                 if m.playing {
@@ -1172,8 +1441,8 @@ impl App {
             // the match is over (a player left, the connection was lost, ...): why, for 3 seconds, then the room saying
             // so
             if net.gone.is_some_and(|g| g >= 180) {
-                if self.room.is_some() {
-                    let why = net.status.clone();
+                if let Some(room) = self.room.as_ref() {
+                    let why = room.why_over(&net.status);
                     self.online_room(Some(why));
                 } else {
                     self.net = None;
@@ -1357,8 +1626,350 @@ impl App {
             return;
         }
         if fight.bout.finished() {
+            // a replay ends on its last frame (the viewer stays); a match played is saved as one, then goes on
+            if self.replay_view.is_some() {
+                self.replay_ended();
+                return;
+            }
+            self.save_replay();
             self.match_over();
         }
+    }
+
+    /// The match just over, saved as a replay (its tape and what made it): a fight, a tag brawl, a Force stage.
+    fn save_replay(&mut self) {
+        let Some(rec) = self.replay_rec.take() else { return };
+        let name = |c: usize| self.roster.characters.get(c).map_or_else(|| "?".to_string(), |c| c.name.clone());
+        let (tape, title, result) = if let Some(t) = self.tag.as_mut() {
+            let Some(tape) = t.game.tape.take() else { return };
+            let s = t.setup.match_slots();
+            let names: Vec<String> = s.iter().map(|p| name(p.character)).collect();
+            let title = if t.game.teams == [0, 0, 1, 1] { format!("TAG BRAWL · {} & {} vs {} & {}", names[0], names[1], names[2], names[3]) } else { format!("TAG BRAWL · {}", names.join(", ")) };
+            let winner = match t.game.phase {
+                kumite_game::tag::TagPhase::MatchOver { winner } => winner,
+                _ => None,
+            };
+            let score = t.game.wins.iter().map(u32::to_string).collect::<Vec<_>>().join("–");
+            let result = winner.map_or_else(|| format!("DRAW {score}"), |w| format!("TEAM {} WINS {score}", w + 1));
+            (tape, title, result)
+        } else if let Some(f) = self.fight.as_mut() {
+            let Some(tape) = f.bout.tape.take() else { return };
+            let winner = match f.bout.phase {
+                Phase::MatchOver { winner } => winner,
+                _ => None,
+            };
+            match &rec.game {
+                replay::Match::Force { start, .. } => {
+                    let number = self.force.as_ref().and_then(|r| r.card().0);
+                    let stage = number.map_or_else(|| "FINAL STAGE".to_string(), |n| format!("STAGE {}", n + 1));
+                    (tape, format!("FORCE · {} · {}", name(start.player.0), stage), if winner == Some(0) { "STAGE CLEAR".into() } else { "GAME OVER".into() })
+                }
+                replay::Match::Fight { setup, .. } => {
+                    let mode = match setup.mode {
+                        Mode::Arcade => "ARCADE",
+                        Mode::Versus => "VS",
+                        Mode::TeamBattle => "TEAM BATTLE",
+                        Mode::TimeAttack => "TIME ATTACK",
+                        Mode::Survival => "SURVIVAL",
+                        Mode::Ball => "BALL",
+                        Mode::ExtraLevels => "EXTRA LEVELS",
+                        _ => "MATCH",
+                    };
+                    let online = if rec.online { "ONLINE " } else { "" };
+                    let score = format!("{}–{}", f.bout.wins[0], f.bout.wins[1]);
+                    let result = winner.map_or_else(|| format!("DRAW {score}"), |w| format!("{} WINS {score}", f.names[w.min(1)]));
+                    (tape, format!("{online}{mode} · {} vs {}", f.names[0], f.names[1]), result)
+                }
+                replay::Match::Tag { .. } => return,
+            }
+        } else {
+            return;
+        };
+        let inputs = tape.to_vec();
+        let file = replay::ReplayFile {
+            version: replay::VERSION,
+            engine: env!("CARGO_PKG_VERSION").into(),
+            data: self.assets.fingerprint(),
+            recorded: replay::now(),
+            title,
+            result,
+            online: rec.online,
+            kept: false,
+            game: rec.game,
+            steps: inputs.len() as u64,
+            hash: self.match_hash(),
+            inputs: replay::encode(&inputs),
+        };
+        match replay::save(&file) {
+            Ok(id) => log::info!("replay {id} saved: {} ({} steps)", file.title, file.steps),
+            Err(e) => log::warn!("the replay was not saved: {e:#}"),
+        }
+    }
+
+    /// Watch a replay: its match loaded from what made it (a fight, a tag brawl, a Force stage), its inputs playing
+    /// it.
+    fn play_replay(&mut self, entry: replay::Entry) {
+        // (checked here, whatever asked: the list, `--replay`, a video)
+        let why = if !entry.file.plays_on(&self.assets.fingerprint()) {
+            Some("it was recorded on other game data or another version")
+        } else if !entry.file.sane(&self.roster) {
+            Some("the file is damaged")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            let said = format!("This replay cannot play here: {why}.");
+            log::warn!("replay {}: {said}", entry.id);
+            match self.replays.as_mut() {
+                Some(b) => b.message = Some(said),
+                None => self.debug.say(said),
+            }
+            return;
+        }
+        let inputs: Arc<[kumite_game::bout::StepInput]> = replay::decode(&entry.file.inputs).into();
+        let game = entry.file.game.clone();
+        self.replays = None;
+        self.replay_counters_before = Some(kumite_game::bout::counters());
+        self.replay_next = Some(Box::new((entry, inputs)));
+        (self.debug.paused, self.debug.speed, self.debug.free_cam) = (false, 1.0, None);
+        self.replay_joins.clear();
+        match game {
+            replay::Match::Fight { setup, ladder, .. } => self.load_fight(setup, ladder),
+            replay::Match::Tag { setup, stage } => {
+                self.replay_tag_stage = Some(self.tag_stage);
+                self.tag_stage = Some(stage);
+                self.start_tag(setup);
+            }
+            replay::Match::Force { setup, start, joins } => {
+                let Some(data) = self.force_data.clone() else {
+                    self.replay_next = None;
+                    self.debug.say("this game data has no Force");
+                    return;
+                };
+                self.force = Some(forcerun::ForceRun::from_start(data, &start));
+                self.replay_joins = joins;
+                self.load_fight(setup, Vec::new());
+            }
+        }
+    }
+
+    /// What the replays' list asked for.
+    fn browser_action(&mut self, action: Option<replay_view::BrowserAction>) {
+        use replay_view::BrowserAction as A;
+        // (after a system dialog: the key that closed it, and its release, stay out of the game)
+        match action {
+            Some(A::Play(e)) => self.play_replay(*e),
+            Some(A::Close) => self.replays = None,
+            Some(A::Export(e)) => {
+                let saved = replay::to_bytes(&e.file).and_then(|b| files::save(&replay::file_name(&e.file), &files::REPLAY, &b));
+                self.keys_after = Some(Instant::now() + Duration::from_millis(400));
+                let said = match saved {
+                    Ok(Some(to)) => format!("Exported: {to}"),
+                    Ok(None) => return,
+                    Err(err) => format!("Not exported: {err:#}"),
+                };
+                if let Some(b) = self.replays.as_mut() {
+                    b.message = Some(said);
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Some(A::Video(e)) => self.video_dialog = Some(video_export::Dialog::new(*e, true, None)),
+            #[cfg(target_arch = "wasm32")]
+            Some(A::Video(_)) => {}
+            Some(A::Import) => {
+                let opened = files::open(&files::REPLAY);
+                self.keys_after = Some(Instant::now() + Duration::from_millis(400));
+                if !opened.is_empty() {
+                    self.import_replays(opened);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The video's options answered (save it: where, then the export), and its panel's buttons.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn video_actions(&mut self, dialog: Option<video_export::DialogAction>, status: Option<video_export::StatusAction>) {
+        match dialog {
+            Some(video_export::DialogAction::Export) => {
+                let Some(d) = self.video_dialog.take() else { return };
+                if self.video_export.as_ref().is_some_and(video_export::Export::running) {
+                    self.debug.say("a video is being made: one at a time");
+                    return;
+                }
+                let name = replay::file_name(&d.entry.file).replace(".okreplay", ".mp4");
+                let out = files::save_path(&name, &files::VIDEO);
+                self.keys_after = Some(Instant::now() + Duration::from_millis(400));
+                let Some(out) = out else { return };
+                match video_export::Export::start(&d, out, &self.assets.root) {
+                    Ok(x) => self.video_export = Some(x),
+                    Err(e) => self.debug.say(format!("the video could not start: {e:#}")),
+                }
+            }
+            Some(video_export::DialogAction::Cancel) => self.video_dialog = None,
+            None => {}
+        }
+        match status {
+            Some(video_export::StatusAction::Cancel) => {
+                if let Some(mut x) = self.video_export.take() {
+                    x.cancel();
+                }
+            }
+            Some(video_export::StatusAction::Show) => {
+                if let Some(x) = self.video_export.as_ref() {
+                    x.show();
+                }
+            }
+            Some(video_export::StatusAction::Close) => self.video_export = None,
+            None => {}
+        }
+    }
+
+    /// Replay files someone shared (opened, or dropped on the window): imported, the list open with the last.
+    fn import_replays(&mut self, opened: Vec<(String, Vec<u8>)>) {
+        let (mut last, mut said) = (None, Vec::new());
+        for (name, bytes) in opened {
+            match replay::import(&bytes) {
+                Ok(id) => {
+                    said.push(format!("Imported {name}"));
+                    last = Some(id);
+                }
+                Err(e) => said.push(format!("{name}: {e:#}")),
+            }
+        }
+        if self.replays.is_none() && self.replay_view.is_none() && (self.screen.is_some() || self.fight.is_none()) {
+            self.replays = Some(replay_view::Browser::new(self.assets.fingerprint(), None));
+        }
+        if let Some(b) = self.replays.as_mut() {
+            b.reload(last.as_deref(), said.join(" · "));
+        } else {
+            self.debug.say(said.join(" · "));
+        }
+    }
+
+    /// Leave the replay: back to the replays over the main menu.
+    fn exit_replay(&mut self) {
+        let Some(v) = self.replay_view.take() else { return };
+        kumite_game::bout::set_counters(v.counters_before);
+        (self.debug.paused, self.debug.speed, self.debug.free_cam) = (false, 1.0, None);
+        (self.fight, self.scene, self.tag, self.force) = (None, None, None, None);
+        if let Some(stage) = self.replay_tag_stage.take() {
+            self.tag_stage = stage;
+        }
+        self.replay_joins.clear();
+        if let Some(vfx) = self.vfx.as_mut() {
+            vfx.clear();
+        }
+        if let Some(a) = self.audio.as_mut() {
+            a.music(None);
+        }
+        self.screen = Some(Screen::menu(menu::difficulty()));
+        self.replays = Some(replay_view::Browser::new(self.assets.fingerprint(), Some(&v.id)));
+    }
+
+    /// Seek the replay to `step`: from the copy before it, run on to it (the sounds and effects of the steps
+    /// passed are not played).
+    fn replay_seek(&mut self, step: usize) {
+        let at = self.replay_played();
+        let Some(v) = self.replay_view.as_mut() else { return };
+        let step = step.min(v.total);
+        if step < v.total {
+            v.ended = false;
+        }
+        let from = (step < at || step - at > replay_view::SNAPSHOT_EVERY).then(|| v.snapshot_before(step).map(|s| s.1.clone())).flatten();
+        if let Some(snap) = from {
+            self.replay_restore(snap);
+        }
+        while self.replay_played() < step && !self.replay_finished() {
+            self.replay_sim_step();
+        }
+        if let Some(vfx) = self.vfx.as_mut() {
+            vfx.clear();
+        }
+        if let Some(f) = self.fight.as_ref() {
+            self.hud.reset(&f.info);
+        }
+        self.lag = Duration::ZERO;
+    }
+
+    /// What the replay viewer asked for this frame.
+    fn replay_requests(&mut self) {
+        let Some(v) = self.replay_view.as_mut() else { return };
+        for r in std::mem::take(&mut v.requests) {
+            match r {
+                replay_view::Request::Seek(s) => self.replay_seek(s),
+                replay_view::Request::TogglePause => {
+                    // at the end: from the start again
+                    if self.replay_finished() {
+                        self.replay_seek(0);
+                        self.debug.paused = false;
+                    } else {
+                        self.debug.paused = !self.debug.paused;
+                    }
+                }
+                replay_view::Request::Step => {
+                    self.debug.paused = true;
+                    self.debug.step_frames += 1;
+                }
+                replay_view::Request::Speed(x) => self.debug.speed = x,
+                replay_view::Request::FreeCam => {
+                    let from = self.game().map(|g| -kumite_game::view_camera(&g.camera.view).1);
+                    self.debug.toggle_free_cam(from);
+                }
+                replay_view::Request::Keep(kept) => {
+                    if let Some(v) = self.replay_view.as_mut() {
+                        match replay::set_kept(&v.id, kept) {
+                            Ok(()) => v.file.kept = kept,
+                            Err(e) => log::warn!("keeping the replay: {e:#}"),
+                        }
+                    }
+                }
+                replay_view::Request::Video =>
+                {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(v) = self.replay_view.as_ref() {
+                        self.debug.paused = true;
+                        let entry = replay::Entry { id: v.id.clone(), file: v.file.clone() };
+                        self.video_dialog = Some(video_export::Dialog::new(entry, v.hud, self.debug.free_cam));
+                    }
+                }
+                replay_view::Request::Exit => {
+                    self.exit_replay();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A key while a replay plays (keyboard or pad): START pauses, BACK leaves, left / right seek 5 s, up / down the
+    /// speed, button 1 a step.
+    fn replay_key(&mut self, key: Key) {
+        let at = self.replay_played();
+        let Some(v) = self.replay_view.as_mut() else { return };
+        let speed = self.debug.speed;
+        let next_speed = |up: bool| {
+            let i = replay_view::SPEEDS.iter().position(|s| (s - speed).abs() < 1e-3).unwrap_or(3);
+            replay_view::SPEEDS[if up { (i + 1).min(replay_view::SPEEDS.len() - 1) } else { i.saturating_sub(1) }]
+        };
+        let r = match key {
+            Key::Start => replay_view::Request::TogglePause,
+            Key::Back => replay_view::Request::Exit,
+            Key::Left => replay_view::Request::Seek(at.saturating_sub(300)),
+            Key::Right => replay_view::Request::Seek(at + 300),
+            Key::Up => replay_view::Request::Speed(next_speed(true)),
+            Key::Down => replay_view::Request::Speed(next_speed(false)),
+            Key::Button(0) => replay_view::Request::Step,
+            Key::Button(1) => replay_view::Request::FreeCam,
+            Key::Button(2) => {
+                v.hud = !v.hud;
+                return;
+            }
+            Key::Button(_) => {
+                v.inputs = !v.inputs;
+                return;
+            }
+        };
+        v.requests.push(r);
     }
 
     /// Online: the room's messages and events, each frame.
@@ -1426,6 +2037,11 @@ impl App {
                     return;
                 }
                 room::RoomEvent::Members => {
+                    // the room's mode cursor back to the top on every computer (the host's list and the keys come in
+                    // one order): one seated just now starts there, so every room screen moves alike
+                    if let Some(Screen::Room(rs)) = self.screen.as_mut() {
+                        rs.cursor = 0;
+                    }
                     // a player of the match on left: the match ends, back to the room
                     let players = room.players();
                     if let Some(n) = self.net.as_ref() {
@@ -1540,11 +2156,17 @@ impl App {
         self.net_start = [false; 2];
         kumite_game::bout::reset_camera_counters();
         room.link.borrow_mut().seats = room.members.iter().map(|m| m.token).collect();
-        log::info!("online: match {session} ({} players), seed {seed}", room.players());
+        let players = room.players();
+        log::info!("online: match {session} ({players} players), seed {seed}");
         self.seed = seed;
         self.screen = None;
+        // (a seat or slot given to a player the room no longer has, or never had: the CPU's, alike everywhere)
+        let here = |p: Option<usize>| p.filter(|&p| p < players);
         match setup {
             room::MatchSetup::Fight(mut setup) => {
+                if let Some(d) = setup.partners.as_mut() {
+                    d.seats = d.seats.map(here);
+                }
                 // BALL: a side nobody plays is the CPU's, the same pick on every computer (from the seed)
                 if setup.mode == Mode::Ball {
                     let n = self.roster.characters.len().max(1);
@@ -1560,8 +2182,16 @@ impl App {
                 }
                 self.load_fight(setup, Vec::new());
             }
-            room::MatchSetup::Tag(setup) if setup.mode == tagrun::TagMode::Force => self.start_room_force(&setup),
-            room::MatchSetup::Tag(setup) => self.start_tag(setup),
+            room::MatchSetup::Tag(mut setup) => {
+                for s in &mut setup.slots {
+                    s.player = here(s.player);
+                }
+                if setup.mode == tagrun::TagMode::Force {
+                    self.start_room_force(&setup);
+                } else {
+                    self.start_tag(setup);
+                }
+            }
         }
         // (the match did not load: the room is left, no session for it)
         self.open_room_session();
@@ -1981,6 +2611,7 @@ impl App {
         match e {
             demo::Event::Key(player, key) => self.menu_key(player, key),
             demo::Event::Cheat(c) => {
+                self.spoil_replay("a cheat changed the match");
                 self.cheat(c);
                 true
             }
@@ -2218,6 +2849,9 @@ impl App {
                     partners: None,
                 };
                 self.load_fight(setup, Vec::new());
+                if spec.force_boss || spec.force_keys != 0 {
+                    self.spoil_replay("--boss / --force-keys changed the stage");
+                }
                 if let Some(st) = self.force.as_mut().and_then(|r| r.stage.as_mut()) {
                     st.keys = spec.force_keys;
                     if spec.force_boss {
@@ -2309,6 +2943,7 @@ impl App {
                 }
             }
             Outcome::Theater(e) => self.theater_event(e),
+            Outcome::OpenReplays => self.replays = Some(replay_view::Browser::new(self.assets.fingerprint(), None)),
             Outcome::OpenGraphics(difficulty) => {
                 self.refit();
                 log::info!("display: {:?}", self.display);
@@ -2592,6 +3227,8 @@ impl App {
     /// (out of play until spawned), the stage logic; the final stage brings its character in at once.
     fn load_force(&mut self, r: &Renderer, setup: FightSetup) -> Result<()> {
         let run = self.force.as_mut().context("no Force run")?;
+        // (the run as this stage begins: a replay of the stage starts from it)
+        let start = run.start();
         let data = run.data.clone();
         let i = run.index.min(data.final_index());
         let c = &self.roster.characters[run.player.0];
@@ -2698,7 +3335,28 @@ impl App {
                 self.join_force_player(p);
             }
         }
+        // every stage is recorded (from here: the players carried over have joined), saved as a replay at its end;
+        // or a replay plays
+        self.replay_rec = None;
+        // (`--ko-boss`: the stage's logic changed, not recorded)
+        if self.replay_next.is_none() && !self.force_ko_boss {
+            if let Some(f) = self.fight.as_mut() {
+                f.bout.tape = Some(Default::default());
+                let game = replay::Match::Force { setup: f.setup.clone().context("the stage's setup")?, start, joins: Vec::new() };
+                self.replay_rec = Some(ReplayRec { game, online: self.net.is_some() || self.room.is_some() });
+            }
+        }
+        self.begin_replay();
         Ok(())
+    }
+
+    /// A player joining a Force stage being recorded (1 the co-op partner, 2 and 3 for 3P and 4P): noted with the
+    /// step it comes before.
+    fn note_force_join(&mut self, who: u8) {
+        let at = self.fight.as_ref().and_then(|f| f.bout.tape.as_ref()).map_or(0, kumite_game::bout::Tape::len) as u64;
+        if let Some(ReplayRec { game: replay::Match::Force { joins, .. }, .. }) = self.replay_rec.as_mut() {
+            joins.push((at, who));
+        }
     }
 
     /// Force for more than two: the soldiers' places and their CPUs for every player (two a player).
@@ -2717,6 +3375,7 @@ impl App {
     /// Force (OpenKumite's own): 3P or 4P (`p` 2, 3) comes in beside the player, as another character (the
     /// run's own pick again on later stages), at full health; the soldiers come two a player from then.
     fn join_force_player(&mut self, p: usize) {
+        self.note_force_join(p as u8);
         self.widen_force();
         let (Some(run), Some(fight)) = (self.force.as_mut(), self.fight.as_mut()) else { return };
         let n = self.roster.characters.len().max(1);
@@ -2727,7 +3386,9 @@ impl App {
             Ok(actor) => {
                 fight.bout.game.join_player(p, &actor);
                 run.more_players[p - 2] = Some((ch, cos, self.roster.costume_of.get(&model).copied().unwrap_or(0)));
-                menu::sfx::play(menu::sfx::start());
+                if !self.replay_quiet {
+                    menu::sfx::play(menu::sfx::start());
+                }
                 log::info!("Force: {}P joins as {} ({model})", p + 1, c.name);
             }
             Err(e) => log::warn!("Force {}P {model}: {e:#}", p + 1),
@@ -2743,6 +3404,7 @@ impl App {
     /// Character in the next costume (or the run's partner again), at full health; the keyboard splits into the
     /// two VS layouts.
     fn join_force_partner(&mut self) {
+        self.note_force_join(1);
         let (Some(run), Some(fight)) = (self.force.as_mut(), self.fight.as_mut()) else { return };
         let (ch, cos) = run.partner.unwrap_or_else(|| {
             let n = self.roster.characters[run.player.0].costumes.len().max(1);
@@ -2765,7 +3427,9 @@ impl App {
                 run.partner = Some((ch, cos));
                 run.partner_costume = self.roster.costume_of.get(&model).copied().unwrap_or(0);
                 fight.partner = Some((format!("m{model:03}"), self.roster.voice_of.get(&model).copied().unwrap_or(c.id)));
-                menu::sfx::play(menu::sfx::start());
+                if !self.replay_quiet {
+                    menu::sfx::play(menu::sfx::start());
+                }
                 log::info!("Force: 2P joins as {} ({model})", c.name);
             }
             Err(e) => log::warn!("the co-op partner {model}: {e:#}"),
@@ -2901,6 +3565,13 @@ impl App {
             .collect();
         if let (Mode::Force, Some(data)) = (setup.mode, self.force_data.as_ref()) {
             records.extend((0..4).filter_map(|k| self.roster.by_selection.get(&(data.soldier_selection_base + k))).map(|s| s.1));
+            // the stage's bosses for up to four players (they load in the middle of the stage, online inside the
+            // rollback step: a browser must have them by then)
+            if let Some(run) = self.force.as_ref().filter(|r| r.extra.is_none()) {
+                let first = data.boss(run.selection, run.player_char, run.index.min(data.final_index()));
+                let model_of = |(c, k): (usize, usize)| self.roster.by_id(c).and_then(|r| r.costumes.get(k.min(r.costumes.len().saturating_sub(1))).copied());
+                records.extend(force_boss_picks(data, &ForceCtx::of(run), first, 4).into_iter().filter_map(model_of));
+            }
         }
         for &(c, costume) in setup.partners.iter().flat_map(|d| d.partners.iter()).filter(|p| p.0 < self.roster.characters.len()) {
             let ch = &self.roster.characters[c];
@@ -2947,9 +3618,17 @@ impl App {
                     let c = &roster.characters[home.character];
                     audio.music(roster.music_of(c.id, home.costume).and_then(|b| sound.music(b)).or_else(|| sound.music_for(&c.name)));
                 }
+                // every brawl is recorded (its inputs on the game's tape), saved as a replay at its end; or a replay plays
+                let mut game = game;
+                self.replay_rec = None;
+                if self.replay_next.is_none() {
+                    game.tape = Some(Default::default());
+                    self.replay_rec = Some(ReplayRec { game: replay::Match::Tag { setup: setup.clone(), stage }, online: self.net.is_some() || self.room.is_some() });
+                }
                 self.tag = Some(tagrun::TagRun::new(game, setup, &self.roster));
                 self.fight = None;
                 self.screen = None;
+                self.begin_replay();
             }
             Err(e) => self.load_failed("the tag brawl", &e),
         }
@@ -2975,6 +3654,11 @@ impl App {
     /// One TAG BRAWL step: four pads (the keyboard's layouts and the gamepads by player), the match, the HUD,
     /// effects and sounds.
     fn step_tag(&mut self) {
+        // a replay at its end stays there
+        if self.replay_view.is_some() && self.tag.as_ref().is_some_and(|t| t.game.finished() && t.game.phase_frame >= TAG_SAVED_AFTER) {
+            self.replay_ended();
+            return;
+        }
         let Some(t) = self.tag.as_ref() else { return };
         let players: Vec<usize> = t.setup.slots.iter().filter_map(|s| s.player).collect();
         // (online: this computer's two players split the keyboard)
@@ -3010,7 +3694,7 @@ impl App {
                 let requests = net.tick(&locals[..net.local.len().min(2)]);
                 let (advanced, fresh) = netplay::apply(net, &mut t.game, requests, &mut |g, all| g.step(slots.map(|s| s.player.and_then(|p| all.get(p).copied()).unwrap_or_default())));
                 if net.gone.is_some_and(|g| g >= 180) {
-                    let why = net.status.clone();
+                    let why = self.room.as_ref().map_or_else(|| net.status.clone(), |r| r.why_over(&net.status));
                     self.online_room(Some(why));
                     return;
                 }
@@ -3085,7 +3769,14 @@ impl App {
             self.restart_tag(setup);
             return;
         }
-        if g.finished() && g.phase_frame >= 150 && t.cont.is_none() {
+        if g.finished() && g.phase_frame >= TAG_SAVED_AFTER && t.cont.is_none() {
+            // the brawl over: saved as a replay (a replay stops here, on its last frame)
+            if self.replay_view.is_some() {
+                self.replay_ended();
+                return;
+            }
+            self.save_replay();
+            let Some(t) = self.tag.as_mut() else { return };
             // online: the arcade's next pair in a session of its own; lost or cleared, back to the setup
             if self.room.is_some() {
                 match t.next() {
@@ -3154,6 +3845,24 @@ impl App {
 
     /// A menu key on a menu screen or the pause menu.
     fn menu_key(&mut self, player: usize, key: Key) -> bool {
+        // the video's options: BACK closes them, the rest is the mouse's
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.video_dialog.is_some() {
+            if key == Key::Back {
+                self.video_dialog = None;
+            }
+            return true;
+        }
+        // the replays' list over the main menu, and a replay playing, take the keys
+        if let Some(b) = self.replays.as_mut() {
+            let action = b.key(key);
+            self.browser_action(action);
+            return true;
+        }
+        if self.replay_view.is_some() && self.screen.is_none() {
+            self.replay_key(key);
+            return true;
+        }
         // players 3 and 4 (gamepads 3 and 4): the setups that seat four take their keys, and Force their
         // START (they join the run, or get up again); nothing else does
         if player >= 2 {
@@ -3593,6 +4302,10 @@ impl App {
         let particles = effects_tex.as_deref().map(|texture| kumite_render::Particles { texture, alpha: &p_alpha, additive: &p_add, flat_alpha: &flat_alpha, flat_add: &flat_add });
         let t = Instant::now();
         let size = r.size();
+        // what the replays' list asked for (a click), and the video's options and panel
+        let mut browser_action = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        let (mut dialog_action, mut status_action) = (None, None);
         let result = match self.egui.as_mut() {
             Some(egui) => {
                 if self.art.is_none() {
@@ -3608,6 +4321,10 @@ impl App {
                 let setup_secs = self.setup_clock.filter(|&f| f != u32::MAX && self.room.is_some()).map(|f| f.div_ceil(60));
                 let Some(art) = self.art.as_ref() else { return };
                 let (screen, fight) = (self.screen.as_ref(), self.fight.as_ref());
+                let (mut replays, mut replay_view) = (self.replays.as_mut(), self.replay_view.as_deref_mut().filter(|_| self.screen.is_none()));
+                #[cfg(not(target_arch = "wasm32"))]
+                let (mut video_dialog, mut video_export) = (self.video_dialog.as_mut(), self.video_export.as_mut());
+                let (paused, speed) = (debug.paused, debug.speed);
                 let force = self.force.as_ref().filter(|_| fight.is_some_and(|f| f.setup.as_ref().is_some_and(|s| s.mode == Mode::Force)));
                 let tag = self.tag.as_ref();
                 let embu_white = self.embu.as_ref().map_or(0, |e| e.scene.white);
@@ -3653,7 +4370,9 @@ impl App {
                             Art::shade(&painter, &view, full, [art::additive(egui::Color32::from_gray(cs.scene.white)); 4]);
                         }
                     } else if let Some(t) = tag {
-                        t.hud.draw(ctx, art, &hud.data, &t.game, &t.info);
+                        if replay_view.as_ref().is_none_or(|v| v.hud) {
+                            t.hud.draw(ctx, art, &hud.data, &t.game, &t.info);
+                        }
                         if let Some((c, player)) = t.pause {
                             draw_pause(ctx, art, &hud.data.pause_items, c, player, frames, false);
                         }
@@ -3681,7 +4400,9 @@ impl App {
                                 run.draw_pickups(painter, view, art, &place);
                             }
                         };
-                        hud.draw_with(ctx, art, &f.bout, &f.info, &pickups);
+                        if replay_view.as_ref().is_none_or(|v| v.hud) {
+                            hud.draw_with(ctx, art, &f.bout, &f.info, &pickups);
+                        }
                         if let Some(run) = force {
                             let view = art::Screen::fit(ctx.content_rect());
                             let window = ctx.content_rect();
@@ -3704,6 +4425,27 @@ impl App {
                             draw_pause(ctx, art, items, c, player, frames, ball);
                         }
                         debug.ui(ctx, &f.bout.game, catalog, &adapter, size);
+                    }
+                    // a replay's controls, over a fight or a tag brawl: the steps played, each player's inputs
+                    if let Some(v) = replay_view.as_deref_mut() {
+                        let (at, inputs): (usize, Vec<(String, &kumite_sim::input::InputState)>) = match (tag, fight) {
+                            (Some(t), _) => (t.game.played(), t.game.melee.actors.iter().enumerate().map(|(i, a)| (format!("{}P", i + 1), &a.input)).collect()),
+                            (None, Some(f)) => (f.bout.played(), f.bout.game.fight.fighters.iter().take(2).enumerate().map(|(i, a)| (format!("P{}", i + 1), &a.input)).collect()),
+                            _ => (0, Vec::new()),
+                        };
+                        v.ui(ctx, at, &inputs, paused, speed, debug.free_cam.is_some());
+                    }
+                    if let Some(b) = replays.as_deref_mut() {
+                        browser_action = b.ui(ctx);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if let Some(d) = video_dialog.as_deref_mut() {
+                            dialog_action = d.ui(ctx);
+                        }
+                        if let Some(x) = video_export.as_deref_mut() {
+                            status_action = x.ui(ctx);
+                        }
                     }
                     if let Some(v) = &video {
                         debug.video_stats(ctx, v);
@@ -3762,6 +4504,15 @@ impl App {
             }
         }
         self.apply_actions();
+        self.browser_action(browser_action);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.video_actions(dialog_action, status_action);
+        // (a browser's picker: the replay files it has read)
+        let opened = files::take_opened();
+        if !opened.is_empty() {
+            self.import_replays(opened);
+        }
+        self.replay_requests();
     }
 
     /// Apply what the debug panel asked for.
@@ -3771,6 +4522,9 @@ impl App {
         for action in std::mem::take(&mut self.debug.actions) {
             if online && !matches!(action, Action::Screenshot) {
                 continue;
+            }
+            if !matches!(action, Action::Screenshot) {
+                self.spoil_replay("the debug panel changed the match");
             }
             let game = self.fight.as_mut().map(|f| &mut f.bout.game);
             match action {
@@ -3863,6 +4617,41 @@ impl App {
     }
 
     /// Debug hotkeys (function keys and - / =). Returns true when the key was one of them.
+    /// The replay viewer's keys besides the menu keys: Space plays / pauses, `.` a step, Home the start, Page Up /
+    /// Down the previous / next round, C the free camera, H the HUD, I the inputs, K keep.
+    fn replay_hotkey(&mut self, code: KeyCode, repeat: bool) -> bool {
+        if self.screen.is_some() {
+            return false;
+        }
+        let at = self.replay_played();
+        let Some(v) = self.replay_view.as_mut() else { return false };
+        use replay_view::Request as R;
+        let r = match code {
+            KeyCode::Space if !repeat => R::TogglePause,
+            KeyCode::Period => R::Step,
+            KeyCode::Home => R::Seek(0),
+            KeyCode::PageUp => R::Seek(v.rounds.iter().rev().map(|r| r.0).find(|&s| s + 30 < at).unwrap_or(0)),
+            KeyCode::PageDown => match v.rounds.iter().map(|r| r.0).find(|&s| s > at) {
+                Some(s) => R::Seek(s),
+                None => return true,
+            },
+            KeyCode::KeyC if !repeat => R::FreeCam,
+            KeyCode::KeyK if !repeat => R::Keep(!v.file.kept),
+            KeyCode::KeyV if !repeat => R::Video,
+            KeyCode::KeyH if !repeat => {
+                v.hud = !v.hud;
+                return true;
+            }
+            KeyCode::KeyI if !repeat => {
+                v.inputs = !v.inputs;
+                return true;
+            }
+            _ => return false,
+        };
+        v.requests.push(r);
+        true
+    }
+
     fn hotkey(&mut self, code: KeyCode) -> bool {
         use demo::{Cheat, Event};
         match code {
@@ -4015,6 +4804,18 @@ impl ForceCtx {
     }
 }
 
+/// A Force stage's bosses for `players` (`first`, the stage's own; more players: a boss each, the next stages'
+/// bosses beside it, none twice); for fewer players, the first of those for more.
+fn force_boss_picks(data: &kumite_game::force::ForceData, ctx: &ForceCtx, first: (usize, usize), players: usize) -> Vec<(usize, usize)> {
+    let mut picks = vec![first];
+    for j in 1..players {
+        let (c, k) = data.boss(ctx.selection, ctx.player_char, (ctx.index + j) % data.final_index().max(1));
+        let k = if picks.contains(&(c, k)) { k + 1 } else { k };
+        picks.push((c, k));
+    }
+    picks
+}
+
 /// A character's actor, loaded once (Force's bosses: a rollback runs a frame again, the load comes from here).
 fn cached_actor(assets: &Assets, cache: &std::cell::RefCell<HashMap<usize, kumite_game::Actor>>, model: usize) -> Option<kumite_game::Actor> {
     if let Some(a) = cache.borrow().get(&model) {
@@ -4054,13 +4855,7 @@ fn force_sim(
                 ForceEvent::Swapped => bout.swap_cpus(),
                 ForceEvent::LoadBoss(ch, cos) => {
                     // more players (OpenKumite's own): a boss each, the next stages' bosses beside this one's
-                    let players = bout.game.players().len();
-                    let mut picks = vec![(ch, cos)];
-                    for j in 1..players {
-                        let (c2, k2) = st.data.boss(ctx.selection, ctx.player_char, (ctx.index + j) % st.data.final_index().max(1));
-                        let k2 = if picks.contains(&(c2, k2)) { k2 + 1 } else { k2 };
-                        picks.push((c2, k2));
-                    }
+                    let picks = force_boss_picks(&st.data, ctx, (ch, cos), bout.game.players().len());
                     let actors: Vec<kumite_game::Actor> = picks.iter().filter_map(|&(c, k)| cached_actor(assets, cache, model_of(c, k)?)).collect();
                     if actors.len() == picks.len() {
                         if actors.len() == 1 {
@@ -4077,6 +4872,8 @@ fn force_sim(
                 }
                 // an extra stage: bosses drawn from its pool (the roster's, none twice, never the player's model),
                 // by the stage's own random numbers
+                // shortcut: not known ahead, so not fetched ahead (`fight_files`): in a browser, online, the first
+                // load of each is a read inside the rollback step; extra stages come from players' own data
                 ForceEvent::LoadBosses { pool, n } => {
                     let n = n.max(bout.game.players().len());
                     let mut pool: Vec<usize> = pool.iter().copied().filter(|&c| roster.by_id(c).is_some()).collect();
@@ -4661,6 +5458,10 @@ impl App {
                 }
             }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(code), state, repeat, ref text, .. }, .. } => {
+                // (a system dialog just closed: the key that closed it is not the game's)
+                if self.keys_after.is_some_and(|t| Instant::now() < t) {
+                    return;
+                }
                 // ONLINE's code / address being typed: the letters and digits go there, not to the controls
                 if let Some(Screen::Online(o)) = self.screen.as_mut() {
                     if o.typing() && state == ElementState::Pressed {
@@ -4702,6 +5503,9 @@ impl App {
                         return;
                     }
                 }
+                if state == ElementState::Pressed && !ui_keyboard && self.replay_hotkey(code, repeat) {
+                    return;
+                }
                 if state == ElementState::Pressed && !repeat && !ui_keyboard && self.hotkey(code) {
                     return;
                 }
@@ -4732,6 +5536,13 @@ impl App {
                     ElementState::Released => {
                         self.keys.remove(&code);
                     }
+                }
+            }
+            // replay files dropped on the window: imported
+            WindowEvent::DroppedFile(path) if path.extension().is_some_and(|e| e == files::REPLAY.ext) => {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    self.import_replays(vec![(name, bytes)]);
                 }
             }
             WindowEvent::Focused(false) => {
@@ -4915,6 +5726,65 @@ impl App {
         self.screen = Some(Screen::menu(menu::difficulty()));
         self.debug.say(format!("ERROR: {what} (back to the main menu)"));
     }
+}
+
+/// `--export-video ID|latest --out FILE.mp4 [--size WxH] [--no-hud] [--free-cam YAW,PITCH,DIST,X,Y,Z]`: the replay
+/// made a video, off-screen, a frame each game step (and a second more on its last), its sounds mixed (video.rs).
+/// Prints `PROGRESS done total` as it goes (the game shows it), then `DONE`.
+#[cfg(not(target_arch = "wasm32"))]
+fn export_video(app: &mut App, id: &str, out: &Path, (width, height): (u32, u32), hud: bool, free_cam: Option<debug::FreeCam>) -> Result<()> {
+    use std::io::Write;
+    let entry = replay::list().into_iter().find(|e| e.id == id || id == "latest").with_context(|| format!("no replay {id}"))?;
+    let total = entry.file.steps;
+    let mut r = Renderer::headless(width, height)?;
+    // (the picture at the video's size: the 3D at 1x, whatever the window's scale)
+    r.set_settings(kumite_render::RenderSettings { scale: 1.0, ..app.graphics.render() });
+    app.egui = Some(EguiLayer::new(r.device(), r.overlay_format(), None));
+    app.audio = Some(audio::Audio::capture());
+    app.renderer = Some(r);
+    app.play_replay(entry);
+    let v = app.replay_view.as_mut().context("the replay did not load (its game data, or its files)")?;
+    (v.hud, v.bar) = (hud, false);
+    app.debug.free_cam = free_cam;
+    let mut writer = video::Writer::new(out, width, height)?;
+    let all = total + video::FPS;
+    // the progress: frames encoded (the rendering runs ahead of them), a few times a second until the end
+    let (encoded, stop) = (writer.encoded(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let reporter = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut stdout = std::io::stdout();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = writeln!(stdout, "PROGRESS {} {all}", encoded.load(std::sync::atomic::Ordering::Relaxed));
+                let _ = stdout.flush();
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        })
+    };
+    for step in 0..all {
+        if step < total {
+            if let Some(c) = app.audio.as_mut().and_then(|a| a.capture.as_mut()) {
+                c.step = step;
+            }
+            app.step();
+        }
+        // (no message on the picture: this process's own, such as the save being another window's)
+        app.debug.hush();
+        app.draw();
+        let img = app.renderer.as_ref().context("renderer")?.capture()?;
+        writer.frame(&img.rgba)?;
+    }
+    let (events, music) = app.audio.as_ref().map_or((Vec::new(), 0.55), |a| (a.capture.as_ref().map_or_else(Vec::new, |c| c.events.clone()), a.music_volume));
+    let finished = writer.finish(&video::mix(&events, all, music));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = reporter.join();
+    finished?;
+    let mut stdout = std::io::stdout();
+    let sounds = events.iter().filter(|e| matches!(e.1, audio::Event::Sfx(..))).count();
+    let tracks = events.iter().filter(|e| matches!(e.1, audio::Event::Music(_))).count();
+    log::info!("{}: {all} frames ({}), {sounds} sounds, {tracks} music changes", out.display(), replay::duration(all));
+    let _ = writeln!(stdout, "DONE");
+    Ok(())
 }
 
 /// `--shot out.png [--frames N] [--p1 script] [--draw ...] [--ui] [--screen
@@ -5403,6 +6273,7 @@ Debug and testing:
   --draw hurt,push,attack,skeleton,samples|all
                                debug overlays
   --record-demo FILE           record the session's inputs; --demo FILE replays one
+  --replay ID|latest           watch a replay (REPLAYS lists them; ID: its file's name)
   --keys \"FRAME:KEY,...\"       scripted menu keys (up down left right start back b1..b4, shot)
   --quit-after N               quit after N drawn frames
   --seed N                     the game's random seed
@@ -5627,6 +6498,7 @@ fn run(root: std::path::PathBuf, args: Vec<String>) -> Result<()> {
         rumble_fight: false,
         tag_stage: None,
         pending_launch: None,
+        pending_replay: None,
         waiting: None,
         net: None,
         room: None,
@@ -5698,6 +6570,20 @@ fn run(root: std::path::PathBuf, args: Vec<String>) -> Result<()> {
         frames: 0,
         logic_steps: 0,
         demo_rec: None,
+        replay_rec: None,
+        replay_next: None,
+        replay_view: None,
+        replay_counters_before: None,
+        replay_joins: Vec::new(),
+        replay_join_next: 0,
+        replay_quiet: false,
+        replay_tag_stage: None,
+        replays: None,
+        keys_after: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        video_dialog: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        video_export: None,
         demo_out: None,
         demo_play: None,
         history: Default::default(),
@@ -5768,6 +6654,7 @@ fn run(root: std::path::PathBuf, args: Vec<String>) -> Result<()> {
     }
     // `--mode NAME ...`: that mode straight away (debugging)
     app.pending_launch = launch::from_args(&args, &app.roster)?;
+    app.pending_replay = arg("--replay");
     if app.pending_launch.is_some() {
         app.screen = None;
     }
@@ -5775,6 +6662,13 @@ fn run(root: std::path::PathBuf, args: Vec<String>) -> Result<()> {
     if !sandbox && arg("--arcade").is_none() && arg("--shot").is_none() && app.pending_launch.is_none() && arg("--online").is_none() && !flag("--host") && !flag("--join") && arg("--screen").is_none()
     {
         app.request_title();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(id) = arg("--export-video") {
+        let out = arg("--out").context("--export-video ID --out FILE.mp4")?;
+        let size = arg("--size").map_or(Ok((1920, 1080)), |s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))).context("--size WIDTHxHEIGHT"))?;
+        let free_cam = app.debug.free_cam;
+        return export_video(&mut app, &id, Path::new(&out), size, !flag("--no-hud"), free_cam);
     }
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = arg("--shot") {
