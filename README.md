@@ -73,6 +73,7 @@ openkumite --fight --models A,B --stage N        # straight into a free fight
 openkumite --shot out.png --frames 120           # headless screenshot
 openkumite --screen select --shot select.png     # render a menu screen
 openkumite --keys "30:start,60:b1,400:shot" --quit-after 600   # scripted run
+openkumite --replay latest --shot out.png --frames 600 --keys "400:right"   # a replay, seeking 5 s on at step 400
 ```
 
 Headless example tools live in `crates/kumite_game/examples/` (`cpu_match`, `trace`, `ko_trace`, ...).
@@ -159,7 +160,7 @@ plays:
 **Sharing.** **Export…** saves a replay as an `.okreplay` file (a couple of KB) to send to anyone; **Import…** (or
 dropping the file on the game's window) adds one, kept. In a browser, Export downloads the file and Import opens the
 browser's file picker. The match is computed the same everywhere, so a replay plays the same on another computer: checked
-so far from macOS to the browser build (it plays to the same end state), not yet between Windows and Linux.
+from macOS to the browser build, to Linux and to Windows, and from Windows to macOS (each plays to the same end state).
 
 **Video.** **Video…** (in the list or while one plays; native builds) makes an MP4 of a replay: 720p, 1080p, 1440p or
 4K, with or without the HUD, from the game's camera or the free camera where it is. It is rendered off-screen at 60
@@ -210,7 +211,8 @@ sh check.sh all 60   # the above and every fuzz target for 60 s each
 ```
 
 The git hooks (`.cargo-husky/hooks`) run `commit` and `push`. Tests read the converted assets from
-`OPENKUMITE_ASSETS` (default `assets/`). The wasm lint needs `rustup target add wasm32-unknown-unknown`;
+`OPENKUMITE_ASSETS` (default `assets/`); the ones that need them skip when they are missing or an older conversion
+(CI has none). The integration tests in `app/tests/` run the game's binary headless and need a GPU too. The wasm lint needs `rustup target add wasm32-unknown-unknown`;
 fuzzing needs nightly and `cargo-fuzz`.
 
 Code rules (workspace lints): no `unsafe` (except the macOS haptics FFI), and no `unwrap` / `expect` / `panic!` on
