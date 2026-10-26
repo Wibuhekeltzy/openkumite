@@ -4,7 +4,7 @@ A 3D fighting game engine in Rust that plays converted game data 1:1, as the ori
 (wgpu + winit) and in the browser (WebAssembly), with local two-player and online rollback netplay.
 
 The repository contains **no game data**. Everything game-specific is produced once by
-[kumite_converter](https://github.com/openkimute/kumite_converter) (a separate project) from your own copy of the game, as standard formats: glTF 2.0,
+[kumite_converter](https://github.com/openkumite/kumite_converter) (a separate project) from your own copy of the game, as standard formats: glTF 2.0,
 PNG, JSON, WAV/FLAC and AVI.
 
 ## Repository layout
@@ -26,7 +26,7 @@ PNG, JSON, WAV/FLAC and AVI.
 
 ## Assets
 
-Convert your own copy of the game with [kumite_converter](https://github.com/openkimute/kumite_converter), then put its output in `assets/` (git-ignored), or point
+Convert your own copy of the game with [kumite_converter](https://github.com/openkumite/kumite_converter), then put its output in `assets/` (git-ignored), or point
 the game at it. The native game looks for the assets in this order:
 
 1. `--assets DIR`
@@ -74,6 +74,7 @@ openkumite --shot out.png --frames 120           # headless screenshot
 openkumite --screen select --shot select.png     # render a menu screen
 openkumite --keys "30:start,60:b1,400:shot" --quit-after 600   # scripted run
 openkumite --replay latest --shot out.png --frames 600 --keys "400:right"   # a replay, seeking 5 s on at step 400
+openkumite --mode vs --ai 1,2 --ai-style 1:rushdown,2:random   # the AI plays seats 1..4 (--ai-difficulty, --ai-level)
 ```
 
 Headless example tools live in `crates/kumite_game/examples/` (`cpu_match`, `trace`, `ko_trace`, ...).
@@ -103,8 +104,8 @@ The page takes the game data from the first of:
 
 `sh web/build.sh --no-server-assets` (`web\build.bat --no-server-assets`) builds a page that never reads the
 server's `assets/`: every player brings their own copy. Every push to `main` deploys that build to GitHub Pages:
-https://openkimute.github.io/openkimute/. kumite_converter's browser page at
-https://openkimute.github.io/kumite_converter/ is on the same site, so a game it converts there is found by the
+https://openkumite.github.io/openkumite/. kumite_converter's browser page at
+https://openkumite.github.io/kumite_converter/ is on the same site, so a game it converts there is found by the
 game's page directly.
 
 The page is a PWA: the browser offers to install it (Chrome and Edge: the install icon in the address bar; Android:
@@ -165,11 +166,13 @@ from macOS to the browser build, to Linux and to Windows, and from Windows to ma
 **Video.** **Video…** (in the list or while one plays; native builds) makes an MP4 of a replay: 720p, 1080p, 1440p or
 4K, with or without the HUD, from the game's camera or the free camera where it is. It is rendered off-screen at 60
 frames a second whatever the computer, its sounds and music mixed from the game's own, and encoded inside the game
-(AV1 video by rav1e, Opus audio): nothing to install, and the game plays on meanwhile (the export runs in a process of
-its own, its progress and Cancel at the top left). The encoding takes its time: on an M1 Pro about 1.5x the replay's
-length at 720p and 3x at 1080p, longer at 4K. AV1 plays in current browsers, VLC and recent phones and TVs; some
+(on macOS HEVC video by the Mac's hardware encoder, elsewhere AV1 by rav1e; Opus audio): nothing to install, and the
+game plays on meanwhile (the export runs in a process of its own, its progress and Cancel at the top left). On an M1
+Pro the hardware encoder takes a quarter of the replay's length at 1080p, two thirds at 4K; AV1 takes its time: about
+1.5x the length at 720p and 3x at 1080p, longer at 4K (`OPENKUMITE_VIDEO=software` chooses it on macOS). AV1 plays in current browsers, VLC and recent phones and TVs; some
 older devices do not play it. From the command line: `openkumite --export-video ID|latest --out FILE.mp4 [--size
 1920x1080] [--no-hud] [--free-cam YAW,PITCH,DIST,X,Y,Z]`.
+`sh packaging/demo_videos.sh` records AI-vs-AI matches headless and makes each an MP4 (`--help` for its options).
 
 A replay plays only on the game data it was recorded on. Before it plays it is run through once (copies kept for
 seeking), and its end is checked against the state recorded: the viewer says **verified**, or that it differs; played
@@ -220,5 +223,5 @@ anything that comes from outside: the game must never crash on bad files or netw
 
 ## License
 
-OpenKumite's code is licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+OpenKumite's code is licensed under the [MIT licence](LICENSE-MIT).
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the vendored code.

@@ -10,13 +10,14 @@
 //! low-HP zeroing) are kept as the game keeps them.
 //!
 //! Not ported (never reached outside these modes): Ball / Force hooks and the attract demo's
-//! frame skip and halved cooldowns.
+//! frame skip and halved cooldowns. (A CPU Force player, OpenKumite's own, plays the stage over the routine: chickens,
+//! the way on, the soldiers around it; [`ForceSight`].)
 
 use crate::data::{Cancel, CancelKind, Move};
 use crate::input::Pad;
 use crate::{Angles, Current, Fighter, GameData, ONE};
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
 
@@ -576,6 +577,19 @@ pub struct Sight<'a> {
     pub opp_chest: f32,
     /// Ball: the ball projected on the line between the fighters (record 8 0x800B4494).
     pub ball: Option<crate::ball::BallSight>,
+    /// A Force player seat: the stage around it (None: the game's CPU, the soldiers' too).
+    pub force: Option<ForceSight<'a>>,
+}
+
+/// What a CPU Force player sees of the stage (OpenKumite's own: the game's Force player is never a CPU).
+pub struct ForceSight<'a> {
+    /// Every actor (players [`crate::Fight::is_player`], soldiers and bosses the others) and the way on
+    /// (`screen_right`).
+    pub fight: &'a crate::Fight,
+    /// My actor index.
+    pub me: usize,
+    /// The roast chickens within reach (simulation positions).
+    pub pickups: &'a [glam::Vec3],
 }
 
 /// Per-frame view of the two actors.
@@ -680,6 +694,13 @@ impl Cx<'_> {
         self.expanded(self.me.current)
     }
 
+    /// My move `to` puts him in the air: its reaction on him standing in front is airborne (a launcher).
+    fn launches(&self, to: Option<Current>) -> bool {
+        let Some(m) = to.and_then(|to| self.me.moves(self.gd, to.bank).moves.get(to.index)) else { return false };
+        let victim = if m.reaction.is_throw() { None } else { self.gd.reactions.entries.get(m.reaction.index).and_then(|e| e.victims.first()) };
+        victim.and_then(|&a| Rec::of(self.gd, self.op, self.op.resolve(a)?)).is_some_and(|v| v.rec4 & 0x400 != 0)
+    }
+
     /// He is in a throw the victim always tries to escape (and the evade plans react to).
     fn escapable(&self) -> bool {
         self.data.escapable(self.op_moveset, self.op.alias)
@@ -704,6 +725,81 @@ fn to_pad(out: u16, facing_right: bool) -> Pad {
     Pad { up: out & 0x1000 != 0, down: out & 0x4000 != 0, left, right, buttons, start: false }
 }
 
+/// A CPU Force player's own moves over the routine (OpenKumite's own; None: the routine fights its foe): a chicken
+/// when hurt (the lowest player hurt takes the nearest), on along the stage while no soldier is near (alone along
+/// its middle line, in co-op no further than 600 ahead of the partner), out to the side from between two soldiers
+/// still coming, to a soldier nobody takes on while the partner has my foe. Down or in the air, the routine gets
+/// up. Draws nothing from the random streams.
+fn force_move(sight: &Sight, s: &ForceSight) -> Option<Pad> {
+    use crate::Fight;
+    let (me, f) = (sight.me, s.fight);
+    if me.current_move(sight.gd).posture.raw & 0x204 != 0 || me.airborne_flag(sight.gd) {
+        return None;
+    }
+    let p = me.root();
+    let flat = |v: glam::Vec3| glam::Vec3::new(v.x, 0.0, v.z);
+    let dist2 = |a: glam::Vec3, b: glam::Vec3| flat(a - b).length_squared();
+    let standing = |i: usize| f.actor(i).filter(|a| !a.inactive && a.health > 0);
+    let pos = |i: usize| f.actor(i).map_or(p, Fighter::root);
+    // a chicken (+50) when 50 down: the lowest of the players hurt takes its nearest first
+    let hurt = |a: &Fighter| a.health <= (a.max_health - 50) * ONE;
+    if hurt(me) {
+        let mut players: Vec<usize> = (0..f.actor_count()).filter(|&i| Fight::is_player(i) && standing(i).is_some_and(hurt)).collect();
+        players.sort_by_key(|&i| (standing(i).map_or(0, |a| a.health), i));
+        let mut left = s.pickups.to_vec();
+        for i in players {
+            let Some(k) = (0..left.len()).min_by(|&a, &b| dist2(left[a], pos(i)).total_cmp(&dist2(left[b], pos(i)))) else { break };
+            let c = left.swap_remove(k);
+            if i == s.me {
+                return Some(force_go(me, c, f));
+            }
+        }
+    }
+    let near: Vec<usize> = (0..f.actor_count()).filter(|&i| !Fight::is_player(i) && standing(i).is_some() && dist2(pos(i), p) < 2500.0 * 2500.0).collect();
+    let partners: Vec<usize> = (0..f.actor_count()).filter(|&i| i != s.me && Fight::is_player(i) && standing(i).is_some()).collect();
+    if near.is_empty() || sight.op.inactive {
+        let ahead = |q: glam::Vec3| q.dot(f.screen_right);
+        let on = partners.iter().map(|&i| ahead(pos(i)) + 600.0 - ahead(p)).fold(1500.0, f32::min);
+        let from = if partners.is_empty() { glam::Vec3::new(p.x, 0.0, 0.0) } else { p };
+        return Some(force_go(me, from + f.screen_right * on, f));
+    }
+    // the two nearest soldiers on either side, both still over 700 away: out of their line, so both come from
+    // in front (by the stage's edge, back towards its middle)
+    let mut close: Vec<usize> = near.iter().copied().filter(|&i| dist2(pos(i), p) < 1800.0 * 1800.0).collect();
+    close.sort_by(|&a, &b| dist2(pos(a), p).total_cmp(&dist2(pos(b), p)));
+    if let [a, b, ..] = close[..] {
+        let (da, db) = (flat(pos(a) - p), flat(pos(b) - p));
+        if da.dot(db) < -0.5 * da.length() * db.length() && da.length() > 700.0 {
+            let side = flat(pos(b) - pos(a)).cross(glam::Vec3::Y);
+            let away = if p.z.abs() > 1200.0 { -p.z * side.z } else { flat(p - pos(a)).dot(side) };
+            let side = if away >= 0.0 { side } else { -side };
+            return Some(force_go(me, p + side * (800.0 / side.length().max(1.0)), f));
+        }
+    }
+    // co-op: a partner nearer my foe takes it on while a soldier near is nobody's: that one is mine
+    let foe = f.opponent_index(s.me);
+    if partners.iter().any(|&i| f.opponent_index(i) == foe && dist2(pos(i), pos(foe)) < dist2(p, pos(foe))) {
+        let free = near.iter().copied().filter(|&i| i != foe && partners.iter().all(|&j| f.opponent_index(j) != i));
+        if let Some(i) = free.min_by(|&a, &b| dist2(pos(a), p).total_cmp(&dist2(pos(b), p))) {
+            return Some(force_go(me, pos(i), f));
+        }
+    }
+    None
+}
+
+/// The pad that takes a Force player towards `to`: walks and runs along the stage, sidesteps (a tap every
+/// sixth frame: held up jumps, held down crouches) across it.
+fn force_go(me: &Fighter, to: glam::Vec3, f: &crate::Fight) -> Pad {
+    let d = to - me.root();
+    // (the screen's right and into the screen: up)
+    let (along, deep) = (d.dot(f.screen_right), d.dot(glam::Vec3::Y.cross(f.screen_right)));
+    if deep.abs() > 300.0 && deep.abs() > along.abs() * 0.5 {
+        let tap = f.frame.is_multiple_of(6);
+        return Pad { up: tap && deep > 0.0, down: tap && deep < 0.0, ..Pad::default() };
+    }
+    Pad { right: along > 100.0, left: along < -100.0, ..Pad::default() }
+}
+
 /// Where control goes after a block of the routine: the output (`LAB_80060E6C`) or the movement chooser.
 enum Flow {
     Fin,
@@ -716,8 +812,14 @@ pub struct Ai {
     /// Global difficulty (0x800AE208) and level (0x800AE211) the profile is taken from.
     pub difficulty: usize,
     pub level: usize,
-    /// Statistics: chain-throw continuations and reaction picks (4.M / 4.O).
+    /// How it plays on top of the game's routine (OpenKumite's own; [`Style::Classic`]: as the game).
+    style: Style,
+    /// The style played now (a Mixed seat's current pick) and, for Mixed, the frames until the next pick.
+    playing: Style,
+    mixt: i32,
+    /// Statistics: chain-throw continuations and reaction picks (4.M / 4.O), sidesteps started.
     pub followups: u32,
+    pub sidesteps: u32,
     /// The round setup (0x80059654) has to run before the next frame.
     pending: bool,
     /// +0x00: the actor slot.
@@ -849,13 +951,73 @@ pub struct Ai {
     thr_op: [i32; 6],
 }
 
+/// How an AI seat plays, on top of the game's routine (OpenKumite's own: a demo's or a test's players). Each
+/// leans the routine's choices its way; [`Style::Classic`] is the game's CPU as it is. Deterministic: whatever it
+/// draws comes from the AI's own random streams, so a replay plays it again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Style {
+    /// The game's CPU, unchanged.
+    #[default]
+    Classic,
+    /// Closes in and attacks all the time: short cooldowns, strings, little guarding.
+    Rushdown,
+    /// Guards, waits for whiffs and punishes them.
+    Defensive,
+    /// Baits and counter-hits: steps in and out of reach, attacks into the other's start-up.
+    Counter,
+    /// Throws whenever in reach, escapes throws.
+    Thrower,
+    /// Sidesteps and moves around, attacks from the side and the back.
+    Evasive,
+    /// Launches and juggles, presses a fallen opponent.
+    Juggler,
+    /// Changes style every so often within a match.
+    Mixed,
+}
+
+impl Style {
+    pub const ALL: [Style; 8] = [Style::Classic, Style::Rushdown, Style::Defensive, Style::Counter, Style::Thrower, Style::Evasive, Style::Juggler, Style::Mixed];
+
+    /// Its name on the command line and in a replay's title.
+    pub fn name(self) -> &'static str {
+        match self {
+            Style::Classic => "classic",
+            Style::Rushdown => "rushdown",
+            Style::Defensive => "defensive",
+            Style::Counter => "counter",
+            Style::Thrower => "thrower",
+            Style::Evasive => "evasive",
+            Style::Juggler => "juggler",
+            Style::Mixed => "mixed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|x| x.name().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
 impl Ai {
+    /// This AI playing `style`.
+    pub fn with_style(mut self, style: Style) -> Self {
+        (self.style, self.playing) = (style, style);
+        self
+    }
+
+    pub fn style(&self) -> Style {
+        self.style
+    }
+
     /// A CPU player in actor slot `slot` (the state block is zero at boot); `difficulty` 0..2, `level` 0..9.
     pub fn new(difficulty: usize, level: usize, slot: usize) -> Self {
         Self {
             difficulty,
             level,
+            style: Style::Classic,
+            playing: Style::Classic,
+            mixt: 0,
             followups: 0,
+            sidesteps: 0,
             pending: true,
             slot: slot as i32,
             p: Profile::default(),
@@ -1001,6 +1163,9 @@ impl Ai {
         self.ringi = 0;
         self.ring = [None; 8];
         (self.now_n, self.now, self.glatch, self.evade) = (false, false, 0, 0);
+        if self.style == Style::Mixed {
+            self.mix(rng);
+        }
         self.load_profile(data, s.me, s.op, -1, -1);
         self.h_vs = data.handlers_of(s.op.moveset.moveset_id).0;
         self.h_self = data.handlers_of(s.me.moveset.moveset_id).1;
@@ -1016,11 +1181,103 @@ impl Ai {
         self.thr_me = data.thresholds(me.character);
         self.thr_op = data.thresholds(op.character);
         self.natk_max = self.p.consecutive_attack_limit_a.max(self.p.consecutive_attack_limit_b);
+        self.lean();
+    }
+
+    /// Mixed: the next style to play (one of the others) and for how long (5..10 s).
+    fn mix(&mut self, rng: &mut AiRng) {
+        self.playing = Style::ALL.get(1 + rng.randint(6) as usize).copied().unwrap_or_default();
+        self.mixt = 300 + rng.randint(300);
+    }
+
+    /// The style's lean on the profile copy (OpenKumite's own; Classic keeps the game's).
+    fn lean(&mut self) {
+        let p = &mut self.p;
+        let at_least = |v: &mut i32, to: i32| *v = (*v).max(to);
+        match self.playing {
+            Style::Classic | Style::Mixed => {}
+            Style::Rushdown => {
+                // short cooldowns (none in a quarter: the next string part at once), long strings, never backing off
+                (p.attack_cooldown_base, p.attack_cooldown_0) = (0, 0);
+                for c in [&mut p.attack_cooldown_1, &mut p.attack_cooldown_2, &mut p.attack_cooldown_3] {
+                    *c /= 3;
+                }
+                at_least(&mut p.fast_poke_prob, 1024);
+                at_least(&mut p.guard_aware_attack_prob, 1024);
+                at_least(&mut p.pressure_on_stun_prob, 4096);
+                p.keep_walk_back_prob = 0;
+                self.natk_max += 6;
+            }
+            Style::Defensive => {
+                // guard nearly everything, punish whiffs, attack less
+                for g in [&mut p.guard_prob, &mut p.guard_prob_cap] {
+                    at_least(g, 2867);
+                }
+                for g in [&mut p.in_string_guard_prob, &mut p.in_string_guard_cap] {
+                    at_least(g, 3891);
+                }
+                for c in [&mut p.counter_attack_prob, &mut p.counter_attack_cap] {
+                    at_least(c, 2048);
+                }
+                at_least(&mut p.parry_prob, 409);
+                at_least(&mut p.throw_escape_prob, 3072);
+                at_least(&mut p.keep_walk_back_prob, 2048);
+                p.throw_attempt_prob /= 2;
+                for c in [&mut p.attack_cooldown_0, &mut p.attack_cooldown_1, &mut p.attack_cooldown_2, &mut p.attack_cooldown_3] {
+                    *c *= 2;
+                }
+            }
+            Style::Counter => {
+                // interrupt his attacks and strings, parry, rarely start anything
+                for c in [&mut p.counter_attack_prob, &mut p.counter_attack_cap] {
+                    at_least(c, 2048);
+                }
+                for c in [&mut p.in_string_interrupt_prob, &mut p.in_string_interrupt_cap] {
+                    at_least(c, 3072);
+                }
+                at_least(&mut p.parry_prob, 1024);
+                at_least(&mut p.keep_walk_back_prob, 4096);
+                for c in [&mut p.attack_cooldown_0, &mut p.attack_cooldown_1, &mut p.attack_cooldown_2, &mut p.attack_cooldown_3] {
+                    *c *= 2;
+                }
+            }
+            Style::Thrower => {
+                // throw whenever in reach, escape every throw, chain throws to their end
+                p.throw_attempt_prob = 4096;
+                p.throw_escape_prob = 4096;
+                p.string_continue_prob = 4096;
+                at_least(&mut p.throw_select_prob, 2867);
+                p.max_string_length += 2;
+            }
+            Style::Evasive => {
+                // sidestep his attacks, evade, keep moving; guard what is not dodged
+                p.sidestep_prob = 4096;
+                p.evade_and_handler_prob = 4096;
+                at_least(&mut p.keep_walk_back_prob, 1024);
+                for g in [&mut p.guard_prob, &mut p.guard_prob_cap] {
+                    at_least(g, 1024);
+                }
+            }
+            Style::Juggler => {
+                // guard and punish (with a launcher), keep a stunned or fallen opponent under pressure, long juggles
+                for g in [&mut p.guard_prob, &mut p.guard_prob_cap] {
+                    at_least(g, 2048);
+                }
+                for c in [&mut p.counter_attack_prob, &mut p.counter_attack_cap] {
+                    at_least(c, 1024);
+                }
+                p.pressure_on_stun_prob = 4096;
+                self.natk_max += 4;
+            }
+        }
     }
 
     /// The pad for this frame (0x80059890). The game calls it only while the CPU has HP left.
     pub fn think(&mut self, data: &AiData, rng: &mut AiRng, s: &Sight) -> Pad {
         self.prepare(data, rng, s);
+        if let Some(pad) = s.force.as_ref().and_then(|f| force_move(s, f)) {
+            return pad;
+        }
         let (gd, me, op) = (s.gd, s.me, s.op);
         let (m, h) = (Rec::of(gd, me, me.current).unwrap_or_default(), Rec::of(gd, op, op.current).unwrap_or_default());
         let d = op.root() - me.root();
@@ -1113,6 +1370,10 @@ impl Ai {
             (self.p.guard_aware_attack_prob, self.p.fast_poke_prob, self.p.counter_attack_prob, self.p.counter_attack_cap) = (0, 0, 0, 0);
         }
         if (cx.lcg() & 0xFFF) as i32 >= self.p.gate_always_zero && self.turn > 0x1FFF && a.opp_turn < 0x6001 && self.hiszone < 3 {
+            self.now = true;
+        }
+        // Evasive: at his side or back, near: attack now
+        if self.playing == Style::Evasive && a.opp_quadrant != 0 && self.hiszone < 3 {
             self.now = true;
         }
         self.mchg = m.id != self.move_prev || mf < self.frame_prev;
@@ -1356,7 +1617,7 @@ impl Ai {
         }
 
         // ---- 4.I whiff punish / hold when already guarded
-        if cx.op.whiffed && ((cx.lcg() & 0xFFF) as i32) < self.p.counter_attack_prob + self.hseq * self.difficulty as i32 * 30 {
+        if cx.op.whiffed && (self.playing == Style::Defensive || ((cx.lcg() & 0xFFF) as i32) < self.p.counter_attack_prob + self.hseq * self.difficulty as i32 * 30) {
             self.now = true;
         } else if (self.pwait >= 0 || h.as_ == 0 || h.as_ - 30 < cx.hf) && self.safe {
             self.out = self.prev_out & 0xF000;
@@ -1851,7 +2112,8 @@ impl Ai {
             if !self.sidestep_ok() || self.hiszone != 2 {
                 return 0;
             }
-            if self.m4 & 1 != 0 || cx.me_air || self.atk || self.hmask != 0x412 {
+            // (Evasive: any attack, not only highs)
+            if self.m4 & 1 != 0 || cx.me_air || self.atk || (self.hmask != 0x412 && self.playing != Style::Evasive) {
                 return 0;
             }
             return if cx.chance(self.p.sidestep_prob) { 4 } else { 0 };
@@ -1907,8 +2169,8 @@ impl Ai {
         if !(self.myzone < 4 && !self.ohigh && self.natk < self.natk_max) {
             return Flow::Movement;
         }
-        // approach first
-        if self.myzone > 2 && cx.randint(12) != 0 {
+        // approach first (Rushdown: the attacks that reach from there too)
+        if self.myzone > 2 && self.playing != Style::Rushdown && cx.randint(12) != 0 {
             return Flow::Movement;
         }
         if self.myzone > 1 && cx.randint(8) == 0 {
@@ -1966,6 +2228,14 @@ impl Ai {
             // Ball: the ball just in front, no throws but an attack (0x800B4720)
             if cx.ball.is_some_and(|b| b.in_front(usize::from(cx.me.side > 0))) {
                 break 'decide self.pool_general(cx);
+            }
+            // Juggler: he is in the air, not attacking: the fast attacks that reach him, now
+            if self.playing == Style::Juggler && self.h4 & 0x400 != 0 && h.as_ == 0 {
+                let mut n = self.pool_fast_poke(cx);
+                if n == 0 {
+                    n = self.pool_general(cx);
+                }
+                break 'decide n;
             }
             if self.odown && !self.op_stance {
                 break 'decide self.okizeme(cx, &mut cd);
@@ -2050,6 +2320,14 @@ impl Ai {
             self.cdash = -1;
             return n;
         }
+        // Juggler: a launcher, if one reaches, while he recovers from his attack
+        if self.playing == Style::Juggler && self.myzone < 3 && cx.h.as_ != 0 && cx.hf > cx.h.ae {
+            let zm = cx.data.zm[self.myzone as usize];
+            let n = self.mark(|c| c.mv.as_ != 0 && c.mv.rec8 & 0x40_0000 == 0 && c.mv.range_class() & zm != 0 && cx.launches(c.mv.id));
+            if n > 0 {
+                return n;
+            }
+        }
         // throws: P10, then P16 picks a command throw (else a button throw)
         if cx.chance(throw_p) && self.myzone < 2 && cx.op_moveset != cx.data.rules.unthrown.moveset {
             let mut n = 0;
@@ -2084,10 +2362,18 @@ impl Ai {
         }
         let crouch_na = |c: &Cand| c.mv.rec4 & 1 == 1 && c.mv.as_ == 0;
         let dash_hop = |c: &Cand| c.e.cmd == 0xC001 || (c.mv.rec4 & 0xA_0000 == 0x8_0000 && c.mv.rec4 & 0x60_0000 == 0);
+        // Rushdown: fast pokes when they reach, else straight to the other attacks
+        let rush = self.playing == Style::Rushdown;
+        if rush {
+            let k = self.pool_fast_poke(cx);
+            if k > 0 {
+                return k;
+            }
+        }
         let mut n;
-        if self.myzone < 3 && !cx.me_air && self.m4 & 1 == 0 && (cx.lcg() & 0x3F) < 14 {
+        if self.myzone < 3 && !cx.me_air && self.m4 & 1 == 0 && (cx.lcg() & 0x3F) < 14 && !rush {
             n = self.mark(crouch_na); // crouch (crouch dash / d moves set-up)
-        } else if (cx.lcg() & 0x3F) < 0x20 {
+        } else if (cx.lcg() & 0x3F) < 0x20 && !rush {
             n = if cx.lcg() & 1 != 0 { self.mark(dash_hop) } else { self.pool_punish_posture(cx) };
         } else {
             if self.cdash < 0 && self.jumpt < 0 && self.m4 & 1 == 0 && !cx.me_air && cx.chance(0x200) {
@@ -2098,7 +2384,7 @@ impl Ai {
                     return k;
                 }
             }
-            n = self.mark(dash_hop);
+            n = if rush && self.myzone < 2 { 0 } else { self.mark(dash_hop) };
             if cx.chance(self.p.guard_aware_attack_prob) {
                 n += self.pool_guard_aware(cx);
             } else if cx.chance(self.p.fast_poke_prob) {
@@ -2126,6 +2412,10 @@ impl Ai {
             } else {
                 n += self.pool_stepin(cx); // against a croucher: no highs, no throws
             }
+        }
+        // Rushdown: nothing of that here, any attack that reaches
+        if n == 0 && self.playing == Style::Rushdown {
+            n = self.pool_general(cx);
         }
         n
     }
@@ -2374,7 +2664,8 @@ impl Ai {
                 self.reset_mv(); // then idle: the movement cooldown is 0x28 now
             }
             // CHOOSE
-            if self.mvcd40 >= 0 || self.hold48 >= 0 {
+            // (Rushdown, Thrower: no pause while out of reach)
+            if (self.mvcd40 >= 0 && !(matches!(self.playing, Style::Rushdown | Style::Thrower) && self.myzone > 1)) || self.hold48 >= 0 {
                 break 'mv;
             }
             let u = cx.randint(4096);
@@ -2498,6 +2789,7 @@ impl Ai {
                 if (mode == 3 || mode == 6) && (self.h4 & 0x8_0000 != 0 || self.hmask != 0) && cx.chance(self.p.gate_always_zero) {
                     mode = 0;
                 }
+                mode = self.lean_mode(mode, u);
             }
             let fwd = if self.crouchf { 0x6000 } else { 0x2000 };
             match mode {
@@ -2563,6 +2855,26 @@ impl Ai {
             } else {
                 0
             };
+        }
+    }
+
+    /// The style's lean on the movement mode (`u` the chooser's draw; 1 dash, 2 walk in, 3 walk back, 4 run,
+    /// 8 sidestep).
+    fn lean_mode(&self, mode: i32, u: i32) -> i32 {
+        match self.playing {
+            // in, never back
+            Style::Rushdown if self.myzone > 2 => 4,
+            Style::Rushdown if self.myzone > 1 && matches!(mode, 0 | 2 | 3 | 6 | 8) => 1,
+            Style::Thrower if self.myzone > 1 && matches!(mode, 0 | 3 | 6 | 8) => 2,
+            Style::Juggler if self.odown && self.myzone > 1 => 2,
+            // at the edge of his reach: out of it when in, back in when out
+            Style::Counter => match self.hiszone {
+                1 | 2 if u < 1536 => 3,
+                3 | 4 if u < 1024 => 2,
+                _ => mode,
+            },
+            Style::Evasive if (2..4).contains(&self.hiszone) && mode == 0 && u < 2048 => 8,
+            _ => mode,
         }
     }
 
@@ -2635,6 +2947,14 @@ impl Ai {
             self.ringi = (self.ringi + 1) & 7;
         }
         self.hp_prev = me.health;
+        // Mixed: another style when its time is up (not in a rage: the rage profile stays)
+        if self.style == Style::Mixed && self.raget < 0 {
+            self.mixt -= 1;
+            if self.mixt < 0 {
+                self.mix(cx.rng);
+                self.load_profile(cx.data, me, op, -1, -1);
+            }
+        }
         if me.struck {
             // learning: guard and counter more, and more so inside his strings
             self.reset_mv();
@@ -2882,6 +3202,7 @@ impl Ai {
         let seq = cx.data.sidestep[(side & 1) as usize].clone();
         self.play(&seq);
         self.reset_mv();
+        self.sidesteps += 1;
     }
 
     /// The sidestep side rule without the random fallback.
@@ -3532,7 +3853,7 @@ mod tests {
 
     /// P2's pad from its CPU.
     fn think(ai: &mut Ai, data: &AiData, rng: &mut AiRng, f: &Fight) -> Pad {
-        let s = Sight { gd: &f.data, me: &f.fighters[1], op: &f.fighters[0], facing_right: f.facing_right(1), opp_chest: 1425.0, ball: None };
+        let s = Sight { gd: &f.data, me: &f.fighters[1], op: &f.fighters[0], facing_right: f.facing_right(1), opp_chest: 1425.0, ball: None, force: None };
         ai.think(data, rng, &s)
     }
 
