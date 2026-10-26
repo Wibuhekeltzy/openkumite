@@ -1,12 +1,15 @@
 # The checks a pull request must pass to be merged into main (the branch's ruleset requires them), as check.sh does
 # them: rustfmt, clippy with warnings as errors (native on each OS, the browser build), the tests, cargo deny. The
 # tests that read the converted game data skip themselves here (there is none: it is copyrighted).
+# A change of only Markdown and LICENSE* files runs no CI at all; such a PR is merged with the admin bypass.
 name: ci
 
 on:
   pull_request:
+    paths-ignore: ["**.md", "**/LICENSE*", "LICENSE*"]
   push:
     branches: [main]
+    paths-ignore: ["**.md", "**/LICENSE*", "LICENSE*"]
 
 permissions:
   contents: read
