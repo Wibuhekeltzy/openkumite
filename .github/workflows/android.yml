@@ -1,0 +1,20 @@
+name: android
+on: workflow_dispatch
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - run: cargo install cargo-ndk
+      - run: sh packaging/android/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openkumite-apk
+          path: target/android/openkumite.apk
